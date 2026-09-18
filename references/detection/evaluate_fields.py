@@ -140,6 +140,84 @@ def fmt(v, pct=True):
     return f"{v:.1%}" if pct else f"{v:.3f}"
 
 
+def recommendations(report: dict, iou_thresh: float) -> tuple[str, list[str]]:
+    """Derive a one-line diagnosis and actionable recommendations from the per-class metrics."""
+    per_class = report["per_class"]
+    n_docs = report["n_docs"]
+    recs: list[str] = []
+    recalls = [s["detection"]["recall"] for s in per_class.values() if s["detection"]["recall"] is not None]
+    precisions = [s["detection"]["precision"] for s in per_class.values() if s["detection"]["precision"] is not None]
+    mean_recall = float(np.mean(recalls)) if recalls else 0.0
+    mean_precision = float(np.mean(precisions)) if precisions else 0.0
+    total_fp = sum(s["detection"]["fp"] for s in per_class.values())
+    total_tp = sum(s["detection"]["tp"] for s in per_class.values())
+
+    if mean_recall < 0.3:
+        diagnosis = "Under-trained detector: most fields are not localised yet."
+        recs.append(
+            "Train longer (hundreds of epochs on a dataset this small; keep `--sched cosine`) and check that the "
+            "validation loss is still decreasing. Try `--bin-thresh 0.1 --box-thresh 0.05` here to see whether the "
+            "fields are emerging below the default thresholds."
+        )
+    elif mean_recall < 0.8:
+        diagnosis = "Detector is learning but misses a sizeable share of the fields."
+        recs.append(
+            "Continue training or lower `--bin-thresh`; inspect the per-class recall below and add data for the "
+            "weakest classes and their templates."
+        )
+    elif mean_precision < 0.8:
+        diagnosis = "Fields are found but too many extra regions are produced."
+        recs.append("Raise `--box-thresh`, use `--top-k-per-class 1` and validate the read text with per-field rules.")
+    else:
+        diagnosis = "Detection is solid; remaining errors come from reading the text."
+
+    if total_fp > 3 * max(total_tp, 1) and report.get("top_k_per_class") is None:
+        recs.append(
+            f"{total_fp} false positives for {total_tp} true positives: pass `--top-k-per-class 1` "
+            "(each field occurs at most once per receipt) and/or raise `--box-thresh`."
+        )
+    for c, s in per_class.items():
+        d, t = s["detection"], s["text"]
+        if d["tp"] + d["fn"] == 0:
+            continue
+        if d["recall"] is not None and d["recall"] < 0.5 and d["tp"] + d["fn"] < 15:
+            recs.append(
+                f"`{c}`: recall {d['recall']:.0%} with only {d['tp'] + d['fn']} annotated boxes in this split; "
+                "collect more examples of this field (target >= 100 per class) or oversample the documents "
+                "that contain it."
+            )
+        fp_absent = s["false_positive_rate_when_absent"]
+        if fp_absent is not None and fp_absent > 0.3 and s["absent_docs"] >= 3:
+            recs.append(
+                f"`{c}`: predicted on {fp_absent:.0%} of the {s['absent_docs']} documents where it is absent; "
+                "train with `--exhaustive-labels` (absence learnt as background) and raise `--box-thresh`."
+            )
+        if d["recall"] is not None and d["recall"] >= 0.7 and t["exact_match"] is not None and t["exact_match"] < 0.7:
+            gap = (t["exact_match_nospace"] or 0) - t["exact_match"]
+            if gap > 0.2:
+                recs.append(
+                    f"`{c}`: detection is fine but the text differs mainly by spaces; use `--reco-mode words` "
+                    "(default) and check the reading-order grouping (`--margin`)."
+                )
+            else:
+                recs.append(
+                    f"`{c}`: detected ({d['recall']:.0%} recall) but read correctly only {t['exact_match']:.0%} "
+                    "of the time; fine-tune the recogniser (Spanish vocabulary, `references/recognition`) or add "
+                    "per-field validation."
+                )
+        if d["mean_iou"] is not None and d["tp"] >= 3 and d["mean_iou"] < 0.7:
+            recs.append(
+                f"`{c}`: matched boxes have a low mean IoU ({d['mean_iou']:.2f}); the regions are loose or fragmented, "
+                f"consider a larger `--margin` or a slightly lower IoU threshold than {iou_thresh} when reading."
+            )
+    if n_docs < 30:
+        recs.append(
+            f"Only {n_docs} validation documents: every percentage point above is ~{100 / n_docs:.0f} % of a document. "
+            "Use grouped K-fold (`convert_documentai.py --folds 5`) before drawing conclusions."
+        )
+    return diagnosis, recs
+
+
 def to_markdown(report: dict, title: str) -> str:
     lines = [f"# {title}", "", f"Documents: {report['n_docs']}  ·  IoU threshold: {report['iou_threshold']}", ""]
     lines.append("| class | P | R | F1 | mIoU | FP rate (absent) | text exact | text exact (no space) |")
@@ -156,6 +234,8 @@ def to_markdown(report: dict, title: str) -> str:
         f"Documents with every required field ({', '.join(report['required_fields'])}) read correctly: "
         f"**{report['docs_all_required_ok']} / {report['n_docs']}** ({fmt(report['docs_all_required_ok_ratio'])})"
     )
+    lines += ["", "## Diagnosis", "", report["diagnosis"], "", "## Recommendations", ""]
+    lines += [f"{i}. {r}" for i, r in enumerate(report["recommendations"], 1)] or ["Nothing to report."]
     return "\n".join(lines) + "\n"
 
 
@@ -180,6 +260,8 @@ def main(args):
         raise ValueError(f"unknown required fields {unknown}, classes are {manifest['class_names']}")
     report = evaluate(manifest, data_dir, extractor, args.iou, args.required)
     report["checkpoint"] = str(args.checkpoint)
+    report["top_k_per_class"] = args.top_k_per_class
+    report["diagnosis"], report["recommendations"] = recommendations(report, args.iou)
     report["reco_mode"] = args.reco_mode
     report["reco_arch"] = args.reco_arch
     title = f"Field evaluation: {Path(args.checkpoint).stem} on {data_dir.name} ({args.reco_mode}/{args.reco_arch})"

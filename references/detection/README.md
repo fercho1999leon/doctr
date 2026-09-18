@@ -187,7 +187,7 @@ python references/detection/evaluate_fields.py --checkpoint runs/db_resnet50_fie
   --required valor_transferido fecha cuenta_destino numero_comprobante
 ```
 
-reports, per class and matched by name: detection precision/recall/F1 at `--iou` (default 0.5), the false-positive rate on documents where the field is absent, the exact match of the read text against the annotation (Unicode NFKC, upper-case, whitespace collapsed; currency symbols and separators removed for amounts) and the share of documents where every required field is correct. A Markdown and a JSON report are written next to the data.
+reports, per class and matched by name: detection precision/recall/F1 at `--iou` (default 0.5), the false-positive rate on documents where the field is absent, the exact match of the read text against the annotation (Unicode NFKC, upper-case, whitespace collapsed; currency symbols and separators removed for amounts) and the share of documents where every required field is correct. The report ends with a diagnosis and a list of recommendations derived from the metrics (train longer, tune thresholds, add data for a class, fine-tune the recogniser, ...). A Markdown and a JSON report are written next to the data.
 
 The pretrained recognition weights use the French vocabulary, which lacks `ñ` and Spanish accents; fine-tuning a recogniser with `VOCABS["spanish"]` (see `references/recognition`) is the natural next step once detection is solid.
 
