@@ -171,7 +171,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python references/detection/train.py db_resnet50 -
   --early-stop --early-stop-epochs 10 --output_dir runs --name db_resnet50_fields
 ```
 
-Run a short pilot (5 epochs) and look at the field-level report before launching the full run. On an NVIDIA machine use `--device 0 --amp -b 4` (or `torchrun` as above).
+Run a short pilot (5 epochs) and look at the field-level report before launching the full run. To train on Google Colab, open `references/detection/colab_train.ipynb` (`File > Open notebook > GitHub`) and follow its cells; checkpoints are saved to Drive so a disconnected session can be resumed. On an NVIDIA machine use `--device 0 --amp -b 4` (or `torchrun` as above).
 
 ### 3. Extract fields
 
