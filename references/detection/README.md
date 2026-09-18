@@ -152,6 +152,7 @@ python references/detection/convert_documentai.py \
 
 - Decodes the embedded page image (format detected from the bytes), converts the normalised vertices to absolute pixels and writes `train/` and `val/` folders in the format above, with every class listed in every entry.
 - Near-duplicate pages (perceptual hash within `--dup-threshold`) are grouped and never split across train/val; exact duplicates are reported.
+- `--test-ratio 0.2` additionally carves a held-out `test/` split before train/val, so no near-duplicate of a test page is ever trained on. Always convert all your folders in one call: converting train and test exports separately cannot detect duplicates across them.
 - The split is stratified on the presence of each class at the group level (`--folds K --fold i` gives a grouped K-fold instead, useful to estimate the variance on small datasets). With a few dozen documents treat `val/` as a **development** set, not as an independent test set.
 - `manifest.json` (per split) keeps the provenance of every page and the annotated text of every box; `audit.json` lists boxes per class, multi-line and long texts, tiny boxes, cross-class overlaps and pages without boxes.
 

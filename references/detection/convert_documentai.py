@@ -11,7 +11,7 @@ entity has a `type` (class), a `mentionText` and a `pageAnchor.pageRefs[0].bound
 
 Output layout (one folder per split):
 
-    <output>/<split>/images/<id>.<ext>
+    <output>/<split>/images/<id>.<ext>          # split = train, val and (with --test-ratio) test
     <output>/<split>/labels.json    # docTR multi-class labels, every class present in every entry
     <output>/<split>/manifest.json  # provenance + annotated text per box (used by evaluate_fields.py)
     <output>/audit.json             # dataset audit (class counts, multi-line texts, tiny/overlapping boxes, ...)
@@ -409,13 +409,20 @@ def main(args):
             log(f"[warn] classes with fewer than {args.min_boxes_per_class} boxes: {rare} (consider --drop)")
 
     groups = group_documents(docs, args.dup_threshold, log)
+    test: list[dict] = []
     if args.folds:
         train, val = kfold_group_split(groups, args.folds, args.fold, args.seed)
         split_desc = f"grouped {args.folds}-fold, fold {args.fold}"
     else:
-        train, val = stratified_group_split(groups, class_names, args.val_ratio, args.seed)
-        split_desc = f"grouped stratified split, val_ratio={args.val_ratio}"
-    log(f"\nSplit ({split_desc}, seed={args.seed}): train={len(train)} val={len(val)}")
+        if args.test_ratio > 0:
+            # Carve the held-out test set first (group-aware, so no near-duplicate of a test page is ever
+            # trained on), then split the remaining groups into train/val
+            remaining, test = stratified_group_split(groups, class_names, args.test_ratio, args.seed)
+            test_ids = {d["id"] for d in test}
+            groups = [g for g in groups if g[0]["id"] not in test_ids]
+        train, val = stratified_group_split(groups, class_names, args.val_ratio, args.seed + 1)
+        split_desc = f"grouped stratified split, val_ratio={args.val_ratio}, test_ratio={args.test_ratio}"
+    log(f"\nSplit ({split_desc}, seed={args.seed}): train={len(train)} val={len(val)} test={len(test)}")
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -430,6 +437,8 @@ def main(args):
         "split_strategy": split_desc,
     }
     splits = {"train": train, args.val_name: val}
+    if test:
+        splits["test"] = test
     for name, split_docs in splits.items():
         write_split(name, split_docs, class_names, out_dir, meta)
         log(f"wrote {name}: {len(split_docs)} images -> {out_dir / name}")
@@ -450,6 +459,12 @@ def parse_args():
     parser.add_argument("--output", required=True, help="output folder (train/ and val/ are created inside)")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="fraction of documents used for validation")
     parser.add_argument("--val-name", default="val", help="name of the validation split folder")
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.0,
+        help="fraction of documents held out in a test/ split (carved before train/val, group-aware)",
+    )
     parser.add_argument("--folds", type=int, default=0, help="if >0, use grouped K-fold instead of a single split")
     parser.add_argument("--fold", type=int, default=0, help="index of the fold used for validation (with --folds)")
     parser.add_argument("--seed", type=int, default=42, help="random seed for the split")
