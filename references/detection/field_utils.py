@@ -28,6 +28,8 @@ __all__ = [
     "resolve_device",
     "FieldExtractor",
     "extract_key",
+    "extract_time",
+    "find_fallback",
     "keys_match",
     "merge_fragments",
     "parse_min_score",
@@ -260,6 +262,7 @@ class FieldExtractor:
         top_k_per_class: int | None = None,
         min_score: dict[str, float] | None = None,
         merge_fragments: bool = False,
+        fallback: bool = False,
     ) -> None:
         from doctr.models import detection_predictor, kie_predictor, ocr_predictor
 
@@ -273,6 +276,8 @@ class FieldExtractor:
         # Per-class minimum detection score (tune it with `evaluate_fields.py --tune-thresholds`)
         self.min_score = dict(min_score or {})
         self.merge_fragments = merge_fragments
+        # Pattern search over the page when the detector returns nothing for a field (words mode only)
+        self.fallback = fallback
         self.device = device
         model, self.cfg = load_detection_checkpoint(checkpoint, device)
         size = input_size or self.cfg.get("input_size") or model.cfg["input_shape"][-1]
@@ -360,19 +365,31 @@ class FieldExtractor:
         ocr_doc = self.ocr(pages)
         results = []
         for regions, page in zip(regions_per_page, ocr_doc.pages):
-            words = [
-                {
-                    "value": w.value,
-                    "confidence": float(w.confidence),
-                    "box": [w.geometry[0][0], w.geometry[0][1], w.geometry[1][0], w.geometry[1][1]],
-                }
-                for block in page.blocks
-                for line in block.lines
-                for w in line.words
-            ]
-            results.append(
-                read_fields_from_words({c: list(regions.get(c, [])) for c in self.class_names}, words, self.margin)
-            )
+            words, lines = [], []
+            for block in page.blocks:
+                for line in block.lines:
+                    if not line.words:
+                        continue
+                    lines.append({
+                        "text": " ".join(w.value for w in line.words),
+                        "confidence": float(np.mean([w.confidence for w in line.words])),
+                        "box": [line.geometry[0][0], line.geometry[0][1], line.geometry[1][0], line.geometry[1][1]],
+                    })
+                    for w in line.words:
+                        words.append({
+                            "value": w.value,
+                            "confidence": float(w.confidence),
+                            "box": [w.geometry[0][0], w.geometry[0][1], w.geometry[1][0], w.geometry[1][1]],
+                        })
+            fields = read_fields_from_words({c: list(regions.get(c, [])) for c in self.class_names}, words, self.margin)
+            for cls_name, entries in fields.items():
+                for entry in entries:
+                    entry["source"] = "detector"
+                if self.fallback and not entries:
+                    hit = find_fallback(cls_name, lines)
+                    if hit is not None:
+                        fields[cls_name] = [hit]
+            results.append(fields)
         return results
 
 
@@ -427,18 +444,30 @@ def _key_fecha(text: str) -> str:
                 continue
         except (KeyError, ValueError):
             continue
-        key = f"{year:04d}-{month:02d}-{day:02d}"
-        tm = _TIME_AFTER_RE.match(t, m.end()) or _TIME_ANY_RE.search(t)
-        if tm:
-            hour, minute, ampm = int(tm.group(1)), tm.group(2), (tm.group(3) or "").replace(".", "")
-            if ampm == "pm" and hour < 12:
-                hour += 12
-            if ampm == "am" and hour == 12:
-                hour = 0
-            if 0 <= hour < 24 and int(minute) < 60:
-                key += f" {hour:02d}:{minute}"
-        return key
+        # The canonical key is the day only: the time is optional on receipts and often printed on another
+        # line, use `extract_time` when you need it
+        return f"{year:04d}-{month:02d}-{day:02d}"
     return ""
+
+
+def extract_time(text: str) -> str:
+    """HH:MM found in a date field ("" if none). Handles glued times, OCR '.' for ':' and am/pm."""
+    t = unicodedata.normalize("NFKC", text or "").lower()
+    tm = None
+    for pat in _DATE_PATTERNS:
+        m = pat.search(t)
+        if m:
+            tm = _TIME_AFTER_RE.match(t, m.end())
+            break
+    tm = tm or _TIME_ANY_RE.search(t)
+    if not tm:
+        return ""
+    hour, minute, ampm = int(tm.group(1)), tm.group(2), (tm.group(3) or "").replace(".", "")
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    return f"{hour:02d}:{minute}" if 0 <= hour < 24 and int(minute) < 60 else ""
 
 
 def _key_amount(text: str) -> str:
@@ -493,6 +522,53 @@ _KEY_EXTRACTORS = {
     "cuenta_destino": _key_account,
     "nombre_cuenta_origen": _key_name,
 }
+
+
+# Fallback patterns searched over the OCR lines of the whole page when the detector finds nothing for a field.
+# Receipts are highly regular, so a pattern hit is almost always the right value.
+_FALLBACK_LINE_PATTERNS: dict[str, re.Pattern] = {
+    # ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR)
+    "cuenta_destino": re.compile(r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}[xX*0]{3,}\d{2,4}\b)"),
+    "numero_comprobante": re.compile(
+        r"(?:n[o°º]\.?|nro\.?|comprobante|documento|referencia|ref\.?)\s*:?\s*([A-Z0-9]{6,})", re.I
+    ),
+    "numero_control": re.compile(r"control\W{0,6}([0-9]{5,})", re.I),
+    "valor_transferido": re.compile(r"(?:\$|usd)\s*\d[\d.,]*", re.I),
+}
+
+
+def find_fallback(field: str, lines: list[dict]) -> dict | None:
+    """Search `lines` ({"text", "box", "confidence"}) for a value of `field` by pattern. Returns a field entry
+    (same shape as the detector output, with `source="fallback"`) or None."""
+    candidates: list[tuple[int, dict, str]] = []
+    if field == "fecha":
+        for i, line in enumerate(lines):
+            if extract_key("fecha", line["text"]):
+                candidates.append((i, line, line["text"]))
+    else:
+        pat = _FALLBACK_LINE_PATTERNS.get(field)
+        if pat is None:
+            return None
+        for i, line in enumerate(lines):
+            m = pat.search(line["text"])
+            if m:
+                candidates.append((i, line, m.group(0)))
+    if not candidates:
+        return None
+    # Prefer the candidate whose canonical key is non-empty, then the first one in reading order
+    for _, line, text in candidates:
+        key = extract_key(field, text)
+        if key:
+            return {
+                "value": text,
+                "normalized": key,
+                "confidence": float(line["confidence"]),
+                "detection_score": None,
+                "geometry": [round(float(v), 4) for v in line["box"]],
+                "words": text.split(),
+                "source": "fallback",
+            }
+    return None
 
 
 def keys_match(field: str, gt_key: str, pred_key: str) -> bool:

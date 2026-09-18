@@ -40,6 +40,7 @@ def main(args):
         top_k_per_class=args.top_k_per_class,
         min_score=parse_min_score(args.min_score),
         merge_fragments=args.merge_fragments,
+        fallback=args.fallback,
     )
     results = {}
     for path in args.images:
@@ -52,7 +53,10 @@ def main(args):
             for cls_name in extractor.class_names:
                 values = fields.get(cls_name, [])
                 shown = (
-                    " | ".join(f"{f['normalized']!r} <- {f['value']!r} ({f['confidence']:.2f})" for f in values)
+                    " | ".join(
+                        f"{f['normalized']!r} <- {f['value']!r} ({f['confidence']:.2f}, {f.get('source', 'detector')})"
+                        for f in values
+                    )
                     if values
                     else "-"
                 )
@@ -88,6 +92,11 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--fallback",
+        action="store_true",
+        help="when the detector finds nothing for a field, search the page OCR lines by pattern (receipt-specific)",
     )
     parser.add_argument(
         "--merge-fragments",

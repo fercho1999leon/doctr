@@ -13,7 +13,8 @@ Reports, per class (matched by name, never by position):
   - false positive rate on documents where the field is absent
   - exact match of the read text against the annotated `mentionText` (normalised, see field_utils.normalize_text)
   - key match: both texts reduced to the canonical value of the field (date -> YYYY-MM-DD, amount -> 0.00,
-    receipt number without "No." prefix, account -> digit suffix, name -> letters), see field_utils.extract_key
+    receipt number without "No." prefix, account -> digit suffix, name -> letters), see field_utils.extract_key.
+    It is geometry-free: the value returned for the field is compared whatever region (or fallback) produced it
   - the percentage of documents where every required field is read correctly (exact and key)
 """
 
@@ -66,6 +67,7 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
     per_doc = []
     # Per class and document: (score of the best-scored prediction or None, has ground truth, best pred matches)
     sweep: dict[str, list[tuple[float | None, bool, bool]]] = {c: [] for c in class_names}
+    sources = {c: collections.Counter() for c in class_names}
 
     for doc in manifest["documents"]:
         n_docs += 1
@@ -106,8 +108,14 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 pred_value = preds[matched_pred[gi]]["value"] if gi in matched_pred else ""
                 gt_norm, pred_norm = normalize_text(gt["text"], c), normalize_text(pred_value, c)
                 exact = gt_norm == pred_norm
-                gt_key, pred_key = extract_key(c, gt["text"]), extract_key(c, pred_value)
+                gt_key = extract_key(c, gt["text"])
+                # Key match is geometry-free: what matters is the value returned for the field, whether it comes
+                # from an IoU-matched region, a loosely placed one or the pattern fallback
+                key_source = preds[matched_pred[gi]] if gi in matched_pred else (best if len(preds) == 1 else None)
+                pred_key = extract_key(c, key_source["value"]) if key_source else ""
                 key_ok = keys_match(c, gt_key, pred_key)
+                if key_ok:
+                    sources[c][key_source.get("source", "detector")] += 1
                 text[c]["exact"] += int(exact)
                 text[c]["exact_nospace"] += int(gt_norm.replace(" ", "") == pred_norm.replace(" ", ""))
                 text[c]["key"] += int(key_ok)
@@ -163,6 +171,7 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 "exact_match": text[c]["exact"] / text[c]["n"] if text[c]["n"] else None,
                 "exact_match_nospace": text[c]["exact_nospace"] / text[c]["n"] if text[c]["n"] else None,
                 "key_match": text[c]["key"] / text[c]["n"] if text[c]["n"] else None,
+                "key_match_by_source": dict(sources[c]),
             },
         }
     thresholds = tune_thresholds(sweep)
@@ -324,7 +333,16 @@ def to_markdown(report: dict, title: str) -> str:
                 f"{fmt(t['f1_at_zero'])} |"
             )
         flags = " ".join(f"{c}={t['best_threshold']:.2f}" for c, t in tuned.items() if t["best_threshold"])
-        lines += ["", f"Apply with: `--min-score {flags}` (in `evaluate_fields.py` and `kie_inference.py`)."]
+        if flags:
+            lines += ["", f"Apply with: `--min-score {flags}` (in `evaluate_fields.py` and `kie_inference.py`)."]
+    if report.get("fallback"):
+        lines += [
+            "",
+            "Key matches recovered by the pattern fallback: "
+            + ", ".join(
+                f"{c} {s['text']['key_match_by_source'].get('fallback', 0)}" for c, s in report["per_class"].items()
+            ),
+        ]
     lines += ["", "## Diagnosis", "", report["diagnosis"], "", "## Recommendations", ""]
     lines += [f"{i}. {r}" for i, r in enumerate(report["recommendations"], 1)] or ["Nothing to report."]
     return "\n".join(lines) + "\n"
@@ -347,6 +365,7 @@ def main(args):
         top_k_per_class=args.top_k_per_class,
         min_score=parse_min_score(args.min_score),
         merge_fragments=args.merge_fragments,
+        fallback=args.fallback,
     )
     unknown = [c for c in args.required if c not in manifest["class_names"]]
     if unknown:
@@ -356,6 +375,7 @@ def main(args):
     report["top_k_per_class"] = args.top_k_per_class
     report["min_score"] = parse_min_score(args.min_score)
     report["merge_fragments"] = args.merge_fragments
+    report["fallback"] = args.fallback
     report["diagnosis"], report["recommendations"] = recommendations(report, args.iou)
     report["reco_mode"] = args.reco_mode
     report["reco_arch"] = args.reco_arch
@@ -396,6 +416,11 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--fallback",
+        action="store_true",
+        help="when the detector finds nothing for a field, search the page OCR lines by pattern (receipt-specific)",
     )
     parser.add_argument(
         "--merge-fragments",
