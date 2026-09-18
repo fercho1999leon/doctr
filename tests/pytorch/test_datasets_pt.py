@@ -1027,3 +1027,41 @@ def test_iiithws_dataset(mock_iiithws_dataset):
     assert len(ds) == 4  # Actual set has 7141797 train and 793533 test samples
     assert repr(ds) == f"IIITHWS(train={True})"
     _validate_dataset_recognition_part(ds, input_size)
+
+
+@pytest.mark.parametrize("use_polygons", [False, True])
+def test_detection_dataset_multiclass_missing_classes(mock_image_folder, tmpdir_factory, use_polygons):
+    # Multi-class labels where some classes are absent (or every class is absent) in a given image
+    poly_a = [[[10, 20], [60, 20], [60, 40], [10, 40]]]
+    poly_b = [[[100, 200], [160, 200], [160, 240], [100, 240]]]
+    per_image = [{"a": poly_a, "b": poly_b}, {"a": poly_a}, {"b": poly_b, "a": []}, {"a": [], "b": []}]
+    labels = {
+        f"mock_image_file_{idx}.jpeg": {"img_dimensions": (800, 600), "img_hash": "h", "polygons": polygons}
+        for idx, polygons in enumerate(per_image)
+    }
+    label_path = tmpdir_factory.mktemp("labels_mc").join("labels.json")
+    with open(label_path, "w") as f:
+        json.dump(labels, f)
+
+    ds = datasets.DetectionDataset(
+        img_folder=mock_image_folder,
+        label_path=str(label_path),
+        img_transforms=Resize((512, 512)),
+        use_polygons=use_polygons,
+    )
+    assert ds.class_names == ["a", "b"]
+    box_shape = (4, 2) if use_polygons else (4,)
+    expected_counts = [{"a": 1, "b": 1}, {"a": 1, "b": 0}, {"a": 0, "b": 1}, {"a": 0, "b": 0}]
+    for idx, counts in enumerate(expected_counts):
+        target = ds[idx].target
+        # Every sample exposes every class, in the same order, so channel indices never shift
+        assert list(target.keys()) == ["a", "b"]
+        for cls_name, n_boxes in counts.items():
+            assert target[cls_name].dtype == np.float32
+            assert target[cls_name].shape == (n_boxes, *box_shape)
+            assert np.all((target[cls_name] >= 0) & (target[cls_name] <= 1))
+
+    loader = DataLoader(ds, batch_size=4, collate_fn=ds.collate_fn)
+    images, targets = next(iter(loader))
+    assert images.shape == (4, 3, 512, 512)
+    assert all(list(t.keys()) == ["a", "b"] for t in targets)

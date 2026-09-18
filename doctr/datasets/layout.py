@@ -5,6 +5,7 @@
 
 import json
 import os
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -89,6 +90,9 @@ class LayoutDataset(AbstractDataset):
                     polygon_classes,
                 ),
             ))
+
+        # Expose every class in every sample so the class -> channel mapping never shifts
+        self._pre_transforms = partial(pre_transform_multiclass, class_names=self.class_names)
 
     def format_polygons(
         self,

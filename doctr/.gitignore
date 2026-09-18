@@ -1,9 +1,0 @@
-
-# fine-tuning invoice
-data/
-datasets/
-*.pt
-*.pth
-*.onnx
-runs/
-wandb/
