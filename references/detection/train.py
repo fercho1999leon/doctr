@@ -592,6 +592,7 @@ def main(args):
         }
 
     if rank == 0:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         # Sidecar written next to every checkpoint: the contract needed to reload the model for inference
         checkpoint_meta = {
             "arch": args.arch,
