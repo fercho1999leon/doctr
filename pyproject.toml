@@ -168,7 +168,7 @@ module = [
 ignore_missing_imports = true
 
 [tool.ruff]
-exclude = [".git", "venv*", "build", "**/__init__.py"]
+exclude = [".git", "venv*", "build", "**/__init__.py", "*.ipynb"]
 line-length = 120
 target-version = "py311"
 preview=true

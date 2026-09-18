@@ -385,7 +385,8 @@ class FieldExtractor:
             for cls_name, entries in fields.items():
                 for entry in entries:
                     entry["source"] = "detector"
-                if self.fallback and not entries:
+                # Fallback when the detector found nothing, or only regions whose text yields no usable value
+                if self.fallback and not any(e["normalized"] for e in entries):
                     hit = find_fallback(cls_name, lines)
                     if hit is not None:
                         fields[cls_name] = [hit]
