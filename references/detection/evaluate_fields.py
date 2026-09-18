@@ -346,6 +346,7 @@ def main(args):
         box_thresh=args.box_thresh,
         top_k_per_class=args.top_k_per_class,
         min_score=parse_min_score(args.min_score),
+        merge_fragments=args.merge_fragments,
     )
     unknown = [c for c in args.required if c not in manifest["class_names"]]
     if unknown:
@@ -354,6 +355,7 @@ def main(args):
     report["checkpoint"] = str(args.checkpoint)
     report["top_k_per_class"] = args.top_k_per_class
     report["min_score"] = parse_min_score(args.min_score)
+    report["merge_fragments"] = args.merge_fragments
     report["diagnosis"], report["recommendations"] = recommendations(report, args.iou)
     report["reco_mode"] = args.reco_mode
     report["reco_arch"] = args.reco_arch
@@ -394,6 +396,11 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--merge-fragments",
+        action="store_true",
+        help="merge vertically adjacent regions of the same class into one (multi-line fields detected line by line)",
     )
     parser.add_argument(
         "--min-score",

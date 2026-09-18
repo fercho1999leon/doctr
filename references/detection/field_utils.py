@@ -29,6 +29,7 @@ __all__ = [
     "FieldExtractor",
     "extract_key",
     "keys_match",
+    "merge_fragments",
     "parse_min_score",
 ]
 
@@ -174,6 +175,36 @@ def read_fields_from_words(
     return out
 
 
+def merge_fragments(boxes: np.ndarray, gap_ratio: float = 0.8) -> np.ndarray:
+    """Merge straight boxes (N, 5) of one class that are vertically adjacent and horizontally overlapping into
+    a single region (union box, max score). Multi-line fields are often detected line by line; merging them
+    restores the annotated block so that it can be matched and read as a whole."""
+    boxes = np.asarray(boxes, dtype=np.float64)
+    if boxes.ndim != 2 or len(boxes) < 2:
+        return boxes
+    order = np.argsort(boxes[:, 1])
+    clusters: list[np.ndarray] = []
+    for b in boxes[order]:
+        merged = False
+        for i, c in enumerate(clusters):
+            h = max(min(c[3] - c[1], b[3] - b[1]), 1e-6)
+            v_gap = max(b[1] - c[3], c[1] - b[3], 0.0)
+            h_overlap = min(c[2], b[2]) - max(c[0], b[0])
+            if v_gap <= gap_ratio * h and h_overlap > 0:
+                clusters[i] = np.array([
+                    min(c[0], b[0]),
+                    min(c[1], b[1]),
+                    max(c[2], b[2]),
+                    max(c[3], b[3]),
+                    max(c[4], b[4]) if len(b) > 4 else 1.0,
+                ])
+                merged = True
+                break
+        if not merged:
+            clusters.append(b.copy() if len(b) > 4 else np.append(b[:4], 1.0))
+    return np.stack(clusters)
+
+
 def load_detection_checkpoint(checkpoint: str | Path, device: torch.device, **overrides):
     """Load a detection model trained with `train.py` from `<name>.pt` + its `<name>.json` sidecar.
 
@@ -228,6 +259,7 @@ class FieldExtractor:
         box_thresh: float | None = None,
         top_k_per_class: int | None = None,
         min_score: dict[str, float] | None = None,
+        merge_fragments: bool = False,
     ) -> None:
         from doctr.models import detection_predictor, kie_predictor, ocr_predictor
 
@@ -240,6 +272,7 @@ class FieldExtractor:
         self.top_k_per_class = top_k_per_class
         # Per-class minimum detection score (tune it with `evaluate_fields.py --tune-thresholds`)
         self.min_score = dict(min_score or {})
+        self.merge_fragments = merge_fragments
         self.device = device
         model, self.cfg = load_detection_checkpoint(checkpoint, device)
         size = input_size or self.cfg.get("input_size") or model.cfg["input_shape"][-1]
@@ -281,6 +314,9 @@ class FieldExtractor:
                 if thr is not None and len(boxes):
                     scores = boxes[:, 4] if boxes.ndim == 2 else boxes[:, 4, 0]
                     boxes = boxes[scores >= thr]
+                if self.merge_fragments and boxes.ndim == 2 and len(boxes) > 1:
+                    boxes = merge_fragments(boxes)
+                    boxes = boxes[np.argsort(-boxes[:, 4])]
                 if self.top_k_per_class is not None:
                     boxes = boxes[: self.top_k_per_class]
                 kept[cls_name] = boxes
