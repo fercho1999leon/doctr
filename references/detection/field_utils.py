@@ -27,6 +27,7 @@ __all__ = [
     "load_detection_checkpoint",
     "resolve_device",
     "FieldExtractor",
+    "extract_key",
 ]
 
 
@@ -149,6 +150,7 @@ def read_fields_from_words(
             text_conf = float(np.mean([w["confidence"] for w in ordered])) if ordered else 0.0
             fields.append({
                 "value": value,
+                "normalized": extract_key(cls_name, value),
                 "confidence": text_conf,
                 "detection_score": score,
                 "geometry": np.round(box, 4).tolist(),
@@ -284,6 +286,7 @@ class FieldExtractor:
                         )
                         fields.setdefault(cls_name, []).append({
                             "value": pred.value,
+                            "normalized": extract_key(cls_name, pred.value),
                             "confidence": float(pred.confidence),
                             "detection_score": None,
                             "geometry": [round(float(v), 4) for v in (x0, y0, x1, y1)],
@@ -315,3 +318,119 @@ class FieldExtractor:
                 read_fields_from_words({c: list(regions.get(c, [])) for c in self.class_names}, words, self.margin)
             )
         return results
+
+
+# --- Canonical keys per field -------------------------------------------------------------------------
+# Receipts write the same value in many ways ("El 16 de septiembre de 2026", "16/09/2026", "2026/sep./16",
+# "No.0000737211", "****** 3861" vs "*** *** 3861"). `extract_key` reduces a field value to the canonical
+# form a downstream system actually needs, so that inference returns it and evaluation scores it.
+
+_MONTHS_ES = {
+    "ene": 1, "enero": 1, "feb": 2, "febrero": 2, "mar": 3, "marzo": 3, "abr": 4, "abril": 4, "may": 5, "mayo": 5,
+    "jun": 6, "junio": 6, "jul": 7, "julio": 7, "ago": 8, "agosto": 8, "sep": 9, "sept": 9, "set": 9,
+    "septiembre": 9, "setiembre": 9, "oct": 10, "octubre": 10, "nov": 11, "noviembre": 11, "dic": 12,
+    "diciembre": 12, "jan": 1, "apr": 4, "aug": 8, "dec": 12,
+}  # fmt: skip
+_MONTH_RE = "|".join(sorted(_MONTHS_ES, key=len, reverse=True))
+_DATE_PATTERNS = [
+    # 16 de septiembre de 2026 / 16 sept 2026 / 16-sep-2026 / E116 de septiembre de 2026 (OCR glued "El")
+    re.compile(rf"(\d{{1,2}})\s*[-/.]?\s*(?:de\s*)?({_MONTH_RE})\.?\s*[-/.]?\s*(?:de\s*)?(\d{{4}})", re.I),
+    # 2026/ago./26 / 2026-sep-16
+    re.compile(rf"(\d{{4}})\s*[-/.]\s*({_MONTH_RE})\.?\s*[-/.]\s*(\d{{1,2}})", re.I),
+    # 2026/09/16 / 2026-09-16
+    re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"),
+    # 16/09/2026 / 16-09-2026 / 16.09.26
+    re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})"),
+]
+_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?")
+_PREFIX_RE = re.compile(r"^(?:n[o°º]\.?|nro\.?|num(?:ero)?\.?|#|comprobante|control|ref\.?)\s*:?\s*", re.I)
+
+
+def _key_fecha(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text).lower()
+    for idx, pat in enumerate(_DATE_PATTERNS):
+        m = pat.search(t)
+        if not m:
+            continue
+        a, b, c = m.groups()
+        try:
+            if idx == 0:
+                day, month, year = int(a), _MONTHS_ES[b.lower()], int(c)
+            elif idx == 1:
+                year, month, day = int(a), _MONTHS_ES[b.lower()], int(c)
+            elif idx == 2:
+                year, month, day = int(a), int(b), int(c)
+            else:
+                day, month, year = int(a), int(b), int(c)
+                if year < 100:
+                    year += 2000
+            if not (1 <= day <= 31 and 1 <= month <= 12):
+                continue
+        except (KeyError, ValueError):
+            continue
+        key = f"{year:04d}-{month:02d}-{day:02d}"
+        tm = _TIME_RE.search(t)
+        if tm and 0 <= int(tm.group(1)) < 24:
+            key += f" {int(tm.group(1)):02d}:{tm.group(2)}"
+        return key
+    return ""
+
+
+def _key_amount(text: str) -> str:
+    m = re.search(r"\d[\d.,]*", text)
+    if not m:
+        return ""
+    raw = m.group(0)
+    if "," in raw and "." in raw:
+        dec = "," if raw.rfind(",") > raw.rfind(".") else "."
+        raw = raw.replace("." if dec == "," else ",", "").replace(dec, ".")
+    elif "," in raw:
+        head, _, tail = raw.rpartition(",")
+        raw = f"{head.replace(',', '')}.{tail}" if len(tail) == 2 else raw.replace(",", "")
+    elif raw.count(".") > 1:
+        head, _, tail = raw.rpartition(".")
+        raw = f"{head.replace('.', '')}.{tail}"
+    try:
+        return f"{float(raw):.2f}"
+    except ValueError:
+        return ""
+
+
+def _key_number(text: str) -> str:
+    """Longest alphanumeric token holding at least 3 digits, without a 'No.'-style prefix."""
+    t = _PREFIX_RE.sub("", unicodedata.normalize("NFKC", text).strip())
+    tokens = re.findall(r"[A-Za-z0-9]+", t)
+    tokens = [tok for tok in tokens if sum(ch.isdigit() for ch in tok) >= 3]
+    if not tokens:
+        # "No.0000737211" with the prefix glued: strip letters before the digits
+        m = re.search(r"\d{3,}", t)
+        return m.group(0) if m else ""
+    return max(tokens, key=len).upper()
+
+
+def _key_account(text: str) -> str:
+    """Last run of digits: masked accounts (****3861, 21XXXXXXX61) are only identified by their suffix."""
+    runs = re.findall(r"\d+", text)
+    return runs[-1] if runs else ""
+
+
+def _key_name(text: str) -> str:
+    t = unicodedata.normalize("NFKD", text)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return re.sub(r"[^A-Z]", "", t.upper())
+
+
+_KEY_EXTRACTORS = {
+    "fecha": _key_fecha,
+    "valor_transferido": _key_amount,
+    "numero_comprobante": _key_number,
+    "numero_control": _key_number,
+    "cuenta_destino": _key_account,
+    "nombre_cuenta_origen": _key_name,
+}
+
+
+def extract_key(field: str, text: str) -> str:
+    """Canonical value of a field ("" when nothing usable is found). Unknown fields fall back to normalize_text."""
+    fn = _KEY_EXTRACTORS.get(field)
+    return fn(text or "") if fn else normalize_text(text or "", field)

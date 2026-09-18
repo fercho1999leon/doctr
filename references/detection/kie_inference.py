@@ -8,9 +8,10 @@
     python references/detection/kie_inference.py --checkpoint runs/db_resnet50_invoices.pt page.jpg [more.png ...]
 
 The class names, architecture and target options are read from the `<checkpoint>.json` sidecar written by
-train.py, so nothing has to be typed by hand. Output: one JSON object per image, `{class: [field, ...]}` where
-every field has `value`, `confidence`, `detection_score`, `geometry` ([xmin, ymin, xmax, ymax], relative) and
-`words`. Classes without detection map to an empty list, so `result["cuenta_destino"]` is always defined.
+train.py, so nothing has to be typed by hand. Output: one JSON object per image, `{class: [field, ...]}`.
+Every field has `value` (text as read), `normalized` (canonical key, see field_utils.extract_key),
+`confidence`, `detection_score`, `geometry` ([xmin, ymin, xmax, ymax], relative) and `words`.
+Classes without detection map to an empty list, so `result["cuenta_destino"]` is always defined.
 """
 
 from __future__ import annotations
@@ -48,7 +49,11 @@ def main(args):
             fields = page_results[0] if len(page_results) == 1 else page_results[0]
             for cls_name in extractor.class_names:
                 values = fields.get(cls_name, [])
-                shown = " | ".join(f"{f['value']!r} ({f['confidence']:.2f})" for f in values) if values else "-"
+                shown = (
+                    " | ".join(f"{f['normalized']!r} <- {f['value']!r} ({f['confidence']:.2f})" for f in values)
+                    if values
+                    else "-"
+                )
                 print(f"{cls_name:24s} {shown}")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
