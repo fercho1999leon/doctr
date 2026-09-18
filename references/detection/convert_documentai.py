@@ -13,6 +13,7 @@ Output layout (one folder per split):
 
     <output>/<split>/images/<id>.<ext>          # split = train, val and (with --test-ratio) test
     <output>/<split>/labels.json    # docTR multi-class labels, every class present in every entry
+    <output>/<split>/labels_layout.json  # same boxes in the layout (LW-DETR) format, see references/layout
     <output>/<split>/manifest.json  # provenance + annotated text per box (used by evaluate_fields.py)
     <output>/audit.json             # dataset audit (class counts, multi-line texts, tiny/overlapping boxes, ...)
 
@@ -311,6 +312,18 @@ def write_split(split_name: str, docs: list[dict], class_names: list[str], out_d
         })
     with open(split_dir / "labels.json", "w", encoding="utf-8") as f:
         json.dump(labels, f, ensure_ascii=False, indent=1)
+    # Same annotations in the layout (object detection) format used by references/layout/train.py
+    layout_labels = {
+        name: {
+            "img_dimensions": entry["img_dimensions"],
+            "img_hash": entry["img_hash"],
+            "polygons": [poly for cls_name in class_names for poly in entry["polygons"][cls_name]],
+            "classes": [cls_name for cls_name in class_names for _ in entry["polygons"][cls_name]],
+        }
+        for name, entry in labels.items()
+    }
+    with open(split_dir / "labels_layout.json", "w", encoding="utf-8") as f:
+        json.dump(layout_labels, f, ensure_ascii=False, indent=1)
     manifest = {**meta, "split": split_name, "class_names": class_names, "documents": manifest_docs}
     with open(split_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=1)

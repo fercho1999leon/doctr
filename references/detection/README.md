@@ -173,6 +173,19 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python references/detection/train.py db_resnet50 -
 
 Run a short pilot (5 epochs) and look at the field-level report before launching the full run. To train on Google Colab, open `references/detection/colab_train.ipynb` (`File > Open notebook > GitHub`) and follow its cells; checkpoints are saved to Drive so a disconnected session can be resumed. On an NVIDIA machine use `--device 0 --amp -b 4` (or `torchrun` as above).
 
+### 2b. Alternative detector: LW-DETR (object detection)
+
+`convert_documentai.py` also writes `labels_layout.json` in every split: the same boxes in the format of `references/layout/train.py`. LW-DETR (`lw_detr_s`, `lw_detr_m`) is a DETR-style object detector pretrained on DocLayNet that predicts one box per region with its class, which suits block-like fields (multi-line addresses/accounts) better than a segmentation model that has to regroup lines:
+
+```shell
+python references/layout/train.py lw_detr_s --pretrained \
+  --train_path data/fields/train --val_path data/fields/val --labels-name labels_layout.json \
+  --device 0 --amp -b 8 --epochs 100 --no-hflip --early-stop --early-stop-epochs 15 \
+  --output_dir runs --name lw_detr_s_fields
+```
+
+The layout script writes the same `<name>.json` sidecar, so `kie_inference.py` and `evaluate_fields.py` accept its checkpoints unchanged (`--box-thresh` then sets the LW-DETR score threshold; `--reco-mode kie` is not available for it). Train both detectors and keep the one with the better field-level report.
+
 ### 3. Extract fields
 
 ```shell

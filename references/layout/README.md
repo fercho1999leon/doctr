@@ -86,6 +86,8 @@ labels.json
 }
 ```
 
+`--labels-name` selects another label file inside the split folders (e.g. `labels_layout.json` written by `references/detection/convert_documentai.py`), `--no-hflip` disables horizontal flips and `--device` accepts a CUDA index, `cuda:N`, `mps` or `cpu`. Every checkpoint is written with a `<name>.json` sidecar (architecture, class names, input size, dataset hashes, git revision, arguments).
+
 ## Slack Logging with tqdm
 
 To enable Slack logging using `tqdm`, you need to set the following environment variables:

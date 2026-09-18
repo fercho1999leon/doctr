@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from doctr.models import detection
+from doctr.models import detection, layout
 
 __all__ = [
     "box_iou",
@@ -226,10 +226,12 @@ def load_detection_checkpoint(checkpoint: str | Path, device: torch.device, **ov
         "pretrained": False,
         "class_names": cfg["class_names"],
         "assume_straight_pages": cfg.get("assume_straight_pages", True),
-        "mask_empty_classes": cfg.get("mask_empty_classes", True),
     }
+    is_layout = cfg["arch"].startswith("lw_detr")
+    if not is_layout:
+        kwargs["mask_empty_classes"] = cfg.get("mask_empty_classes", True)
     kwargs.update(overrides)
-    model = detection.__dict__[cfg["arch"]](**kwargs)
+    model = (layout if is_layout else detection).__dict__[cfg["arch"]](**kwargs)
     state = torch.load(ckpt, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     if list(model.class_names) != list(cfg["class_names"]):
@@ -279,15 +281,24 @@ class FieldExtractor:
         # Pattern search over the page when the detector returns nothing for a field (words mode only)
         self.fallback = fallback
         self.device = device
+        from doctr.models import layout_predictor
+
         model, self.cfg = load_detection_checkpoint(checkpoint, device)
+        self.is_layout = self.cfg["arch"].startswith("lw_detr")
         size = input_size or self.cfg.get("input_size") or model.cfg["input_shape"][-1]
         model.cfg = {**model.cfg, "input_shape": (3, size, size)}
-        if bin_thresh is not None:
-            model.postprocessor.bin_thresh = bin_thresh
-        if box_thresh is not None:
-            model.postprocessor.box_thresh = box_thresh
+        if self.is_layout:
+            # LW-DETR: one score threshold on the class logits (the `--box-thresh` CLI value)
+            if box_thresh is not None:
+                model.postprocessor.score_thresh = box_thresh
+        else:
+            if bin_thresh is not None:
+                model.postprocessor.bin_thresh = bin_thresh
+            if box_thresh is not None:
+                model.postprocessor.box_thresh = box_thresh
         self.class_names = list(self.cfg["class_names"])
-        self.field_detector = detection_predictor(
+        build = layout_predictor if self.is_layout else detection_predictor
+        self.field_detector = build(
             arch=model,
             pretrained=False,
             assume_straight_pages=self.cfg.get("assume_straight_pages", True),
@@ -296,6 +307,8 @@ class FieldExtractor:
         ).to(device)
         if mode == "words":
             self.ocr = ocr_predictor(det_arch_words, reco_arch, pretrained=True, assume_straight_pages=True).to(device)
+        elif self.is_layout:
+            raise ValueError("'kie' reading mode needs a text-detection checkpoint; LW-DETR checkpoints use 'words'")
         else:
             self.kie = kie_predictor(det_arch=model, reco_arch=reco_arch, pretrained=True, assume_straight_pages=True)
             self.kie = self.kie.to(device)
@@ -304,7 +317,20 @@ class FieldExtractor:
     def detect(self, pages: list[np.ndarray]) -> list[dict[str, np.ndarray]]:
         """Relative field boxes per page: {class: (N, 5) [xmin, ymin, xmax, ymax, score]}, best scores first."""
         results = []
-        for regions in self.field_detector(pages):
+        raw = self.field_detector(pages)
+        if self.is_layout:
+            # {"class_names": [...], "boxes": (N, 4), "scores": [...]} -> {class: (N, 5)}
+            raw = [
+                {
+                    c: np.array(
+                        [[*b, s] for n, b, s in zip(page["class_names"], page["boxes"], page["scores"]) if n == c],
+                        dtype=np.float64,
+                    ).reshape(-1, 5)
+                    for c in self.class_names
+                }
+                for page in raw
+            ]
+        for regions in raw:
             kept = {}
             for cls_name, boxes in regions.items():
                 boxes = np.asarray(boxes)

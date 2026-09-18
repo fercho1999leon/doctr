@@ -5,6 +5,7 @@
 
 import datetime
 import hashlib
+import json
 import logging
 import multiprocessing
 import os
@@ -36,6 +37,7 @@ else:
 
 from ddp_utils import ShardSampler, barrier_download, is_main_rank, reduce_sum, sync_val_metric
 
+import doctr
 from doctr import transforms as T
 from doctr.datasets import LayoutDataset
 from doctr.models import layout, login_to_hub, push_to_hf_hub
@@ -77,9 +79,9 @@ def record_lr(
     for batch_idx, (images, targets) in enumerate(train_loader):
         imgs, padding_masks = images
 
-        if torch.cuda.is_available():
-            imgs = imgs.cuda()
-            padding_masks = padding_masks.cuda()
+        _dev = _model_device(model)
+        imgs = imgs.to(_dev, non_blocking=True)
+        padding_masks = padding_masks.to(_dev, non_blocking=True)
 
         imgs = batch_transforms(imgs)
 
@@ -127,9 +129,9 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, a
     pbar = tqdm(train_loader, dynamic_ncols=True, disable=(rank != 0))
     for images, targets in pbar:
         imgs, padding_masks = images
-        if torch.cuda.is_available():
-            imgs = imgs.cuda()
-            padding_masks = padding_masks.cuda()
+        _dev = _model_device(model)
+        imgs = imgs.to(_dev, non_blocking=True)
+        padding_masks = padding_masks.to(_dev, non_blocking=True)
         imgs = batch_transforms(imgs)
 
         optimizer.zero_grad()
@@ -178,9 +180,9 @@ def evaluate(model, val_loader, batch_transforms, val_metric, amp=False, log=Non
     pbar = tqdm(val_loader, dynamic_ncols=True, disable=not is_main_rank())
     for images, targets in pbar:
         imgs, padding_masks = images
-        if torch.cuda.is_available():
-            imgs = imgs.cuda()
-            padding_masks = padding_masks.cuda()
+        _dev = _model_device(model)
+        imgs = imgs.to(_dev, non_blocking=True)
+        padding_masks = padding_masks.to(_dev, non_blocking=True)
         imgs = batch_transforms(imgs)
         if amp:
             with torch.amp.autocast("cuda"):
@@ -224,6 +226,47 @@ def evaluate(model, val_loader, batch_transforms, val_metric, amp=False, log=Non
     )
 
 
+def resolve_device(device: str | int | None) -> torch.device:
+    """CLI device spec (None, "cpu", "mps", "cuda", "cuda:1", 0) -> torch device. None = CUDA > MPS > CPU."""
+    if device is None or device == "":
+        if torch.cuda.is_available():
+            return torch.device("cuda", 0)
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if isinstance(device, int) or (isinstance(device, str) and device.isdigit()):
+        index = int(device)
+        if not torch.cuda.is_available():
+            raise AssertionError("PyTorch cannot access your GPU. Please investigate!")
+        if index >= torch.cuda.device_count():
+            raise ValueError("Invalid device index")
+        return torch.device("cuda", index)
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        raise AssertionError("PyTorch cannot access your GPU. Please investigate!")
+    if dev.type == "mps" and not torch.backends.mps.is_available():
+        raise AssertionError("MPS backend is not available on this machine.")
+    return dev
+
+
+def _model_device(model: torch.nn.Module) -> torch.device:
+    return next(model.parameters()).device
+
+
+def identity(x):
+    """No-op augmentation (module-level so DataLoader workers can pickle it on macOS/Windows)."""
+    return x
+
+
+def _git_revision() -> str | None:
+    try:
+        import subprocess
+
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+
 def main(args):
     # Detect distributed setup
     # variable is set by torchrun
@@ -239,18 +282,12 @@ def main(args):
     else:
         # single process
         rank = 0
-        if isinstance(args.device, int):
-            if not torch.cuda.is_available():
-                raise AssertionError("PyTorch cannot access your GPU. Please investigate!")
-            if args.device >= torch.cuda.device_count():
-                raise ValueError("Invalid device index")
-            device = torch.device("cuda", args.device)
-        # Silent default switch to GPU if available
-        elif torch.cuda.is_available():
-            device = torch.device("cuda", 0)
-        else:
+        device = resolve_device(args.device)
+        if device.type == "cpu":
             logging.warning("No accessible GPU, target device set to CPU.")  # noqa: LOG015
-            device = torch.device("cpu")
+    if args.amp and device.type != "cuda":
+        raise ValueError("--amp (automatic mixed precision) is only supported on CUDA devices")
+    use_cuda = device.type == "cuda"
 
     slack_token = os.getenv("TQDM_SLACK_TOKEN")
     slack_channel = os.getenv("TQDM_SLACK_CHANNEL")
@@ -283,7 +320,7 @@ def main(args):
     st = time.time()
     val_set = LayoutDataset(
         img_folder=os.path.join(args.val_path, "images"),
-        label_path=os.path.join(args.val_path, "labels.json"),
+        label_path=os.path.join(args.val_path, args.labels_name),
         sample_transforms=T.SampleCompose(
             (
                 # Important to return padding masks for layout models
@@ -324,13 +361,13 @@ def main(args):
         num_workers=args.workers,
         # Shard without padding so no sample is validated twice (see ShardSampler)
         sampler=ShardSampler(val_set, rank=rank) if distributed else SequentialSampler(val_set),
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_cuda,
         collate_fn=val_set.collate_fn,
     )
     if rank == 0:
         batch_info = f"{len(val_loader)} batches/rank" if distributed else f"{len(val_loader)} batches"
         pbar.write(f"Validation set loaded in {time.time() - st:.4f}s ({len(val_set)} samples in {batch_info})")
-    with open(os.path.join(args.val_path, "labels.json"), "rb") as f:
+    with open(os.path.join(args.val_path, args.labels_name), "rb") as f:
         val_hash = hashlib.sha256(f.read()).hexdigest()
 
     cls_container[0] = val_set.class_names
@@ -365,9 +402,9 @@ def main(args):
         if rank == 0:
             pbar.write("Running evaluation")
         # Only moved further down, past this early return
-        if torch.cuda.is_available():
+        if use_cuda:
             torch.cuda.set_device(device)
-            model = model.to(device)
+        model = model.to(device)
         val_loss, map5095, ap50, ap75 = evaluate(
             model,
             val_loader,
@@ -401,13 +438,14 @@ def main(args):
             T.ImageTorchvisionTransform(RandomGrayscale(p=0.15)),
         ]),
         T.ImageTorchvisionTransform(RandomPhotometricDistort(p=0.3)),
-        lambda x: x,  # Identity no transformation
+        identity,  # Identity no transformation
     ])
     # Image + target augmentations
+    hflip = [] if args.no_hflip else [T.RandomHorizontalFlip(0.15)]
     sample_transforms = T.SampleCompose(
         (
             [
-                T.RandomHorizontalFlip(0.15),
+                *hflip,
                 T.OneOf([
                     T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
@@ -421,7 +459,7 @@ def main(args):
             ]
             if not args.rotation
             else [
-                T.RandomHorizontalFlip(0.15),
+                *hflip,
                 T.OneOf([
                     T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
@@ -443,7 +481,7 @@ def main(args):
     # Load both train and val data generators
     train_set = LayoutDataset(
         img_folder=os.path.join(args.train_path, "images"),
-        label_path=os.path.join(args.train_path, "labels.json"),
+        label_path=os.path.join(args.train_path, args.labels_name),
         img_transforms=img_transforms,
         sample_transforms=sample_transforms,
         use_polygons=args.rotation,
@@ -460,7 +498,7 @@ def main(args):
         drop_last=True,
         num_workers=args.workers,
         sampler=sampler,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_cuda,
         collate_fn=train_set.collate_fn,
     )
 
@@ -476,7 +514,7 @@ def main(args):
             f"Train set loaded in {time.time() - st:.4f}s ({len(train_set)} samples in {len(train_loader)} batches)"
         )
 
-    with open(os.path.join(args.train_path, "labels.json"), "rb") as f:
+    with open(os.path.join(args.train_path, args.labels_name), "rb") as f:
         train_hash = hashlib.sha256(f.read()).hexdigest()
 
     if args.show_samples:
@@ -495,9 +533,9 @@ def main(args):
         for p in model.feat_extractor.parameters():
             p.requires_grad = False
 
-    if torch.cuda.is_available():
+    if use_cuda:
         torch.cuda.set_device(device)
-        model = model.to(device)
+    model = model.to(device)
 
     if distributed:
         # construct DDP model
@@ -667,6 +705,27 @@ def main(args):
 
     # Create loss queue
     min_loss = np.inf
+    if rank == 0:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        # Sidecar written next to every checkpoint: the contract needed to reload the model for inference
+        checkpoint_meta = {
+            "arch": args.arch,
+            "class_names": list(class_names),
+            "input_size": args.input_size,
+            "assume_straight_pages": not args.rotation,
+            "train_hash": train_hash,
+            "val_hash": val_hash,
+            "git_revision": _git_revision(),
+            "torch_version": torch.__version__,
+            "doctr_version": doctr.__version__,
+            "args": dict(vars(args)),
+        }
+
+        def save_checkpoint(params: torch.nn.Module, stem: str) -> None:
+            torch.save(params.state_dict(), Path(args.output_dir) / f"{stem}.pt")
+            with open(Path(args.output_dir) / f"{stem}.json", "w", encoding="utf-8") as f:
+                json.dump(checkpoint_meta, f, indent=1, default=str)
+
     if args.early_stop:
         early_stopper = EarlyStopper(patience=args.early_stop_epochs, min_delta=args.early_stop_delta)
 
@@ -699,11 +758,11 @@ def main(args):
             params = model.module if hasattr(model, "module") else model
             if val_loss < min_loss:
                 pbar.write(f"Validation loss decreased {min_loss:.6f} --> {val_loss:.6f}: saving state...")
-                torch.save(params.state_dict(), Path(args.output_dir) / f"{exp_name}.pt")
+                save_checkpoint(params, exp_name)
                 min_loss = val_loss
             if args.save_interval_epoch:
                 pbar.write(f"Saving state at epoch: {epoch + 1}")
-                torch.save(params.state_dict(), Path(args.output_dir) / f"{exp_name}_epoch{epoch + 1}.pt")
+                save_checkpoint(params, f"{exp_name}_epoch{epoch + 1}")
             log_msg = f"Epoch {epoch + 1}/{args.epochs} - Validation loss: {val_loss:.6} "
             if any(val is None for val in (map5095, ap50, ap75)):
                 log_msg += "(Undefined metric value, caused by empty GTs or predictions)"
@@ -762,8 +821,9 @@ def parse_args():
     parser.add_argument(
         "--device",
         default=None,
-        type=int,
-        help="Specify gpu device for single-gpu training. In destributed setting, this parameter is ignored",
+        type=str,
+        help="Device for single-process training: a CUDA index (e.g. 0), 'cuda:N', 'mps' or 'cpu'. "
+        "Default: CUDA if available, else MPS, else CPU. Ignored in distributed mode.",
     )
     parser.add_argument("arch", type=str, help="text-detection model to train")
     parser.add_argument("--output_dir", type=str, default=".", help="path to save checkpoints and final model")
@@ -798,6 +858,12 @@ def parse_args():
         help="Load pretrained parameters before starting the training",
     )
     parser.add_argument("--rotation", dest="rotation", action="store_true", help="train with rotated documents")
+    parser.add_argument("--no-hflip", action="store_true", help="disable the horizontal flip augmentation")
+    parser.add_argument(
+        "--labels-name",
+        default="labels.json",
+        help="name of the label file inside train/val folders (e.g. labels_layout.json from convert_documentai.py)",
+    )
     parser.add_argument(
         "--eval-straight",
         action="store_true",
