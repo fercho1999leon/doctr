@@ -144,3 +144,11 @@ wandb/
 *.pt
 *.pb
 *.index
+
+# Fine-tuning datasets & checkpoints (invoice KIE)
+docs/ENTRENAMIENTO/
+/data/
+/datasets/
+*.pth
+*.onnx
+runs/

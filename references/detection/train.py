@@ -5,6 +5,7 @@
 
 import datetime
 import hashlib
+import json
 import logging
 import multiprocessing
 import os
@@ -22,12 +23,15 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms.v2 import Compose, Normalize, RandomGrayscale, RandomPhotometricDistort
 
+import doctr
+
 if os.getenv("TQDM_SLACK_TOKEN") and os.getenv("TQDM_SLACK_CHANNEL"):
     from tqdm.contrib.slack import tqdm
 else:
     from tqdm.auto import tqdm
 
 from ddp_utils import ShardSampler, barrier_download, is_main_rank, reduce_sum, sync_val_metric
+from field_utils import resolve_device
 
 from doctr import datasets
 from doctr import transforms as T
@@ -53,6 +57,15 @@ def convert_to_multiclass_targets(targets: list) -> list[dict[str, np.ndarray]]:
         the batch of targets as a list of `{class_name: boxes}` dictionaries
     """
     return [target if isinstance(target, dict) else {CLASS_NAME: target} for target in targets]
+
+
+def identity(x):
+    """No-op augmentation (a module-level function so DataLoader workers can pickle it on macOS/Windows)."""
+    return x
+
+
+def _model_device(model: torch.nn.Module) -> torch.device:
+    return next(model.parameters()).device
 
 
 def record_lr(
@@ -86,9 +99,9 @@ def record_lr(
     if amp:
         scaler = torch.amp.GradScaler("cuda")
 
+    device = _model_device(model)
     for batch_idx, (images, targets) in enumerate(train_loader):
-        if torch.cuda.is_available():
-            images = images.cuda()
+        images = images.to(device, non_blocking=True)
 
         images = batch_transforms(images)
         targets = convert_to_multiclass_targets(targets)
@@ -134,10 +147,10 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, a
     model.train()
     # Iterate over the batches of the dataset
     epoch_train_loss, batch_cnt = 0, 0
+    device = _model_device(model)
     pbar = tqdm(train_loader, dynamic_ncols=True, disable=(rank != 0))
     for images, targets in pbar:
-        if torch.cuda.is_available():
-            images = images.cuda()
+        images = images.to(device, non_blocking=True)
         images = batch_transforms(images)
         targets = convert_to_multiclass_targets(targets)
 
@@ -184,10 +197,10 @@ def evaluate(model, val_loader, batch_transforms, val_metric, args, amp=False, l
     # Validation loop
     # Weight by samples, not batches, so the result is independent of the sharding
     val_loss, sample_cnt = 0, 0
+    device = _model_device(model)
     pbar = tqdm(val_loader, dynamic_ncols=True, disable=not is_main_rank())
     for images, targets in pbar:
-        if torch.cuda.is_available():
-            images = images.cuda()
+        images = images.to(device, non_blocking=True)
         images = batch_transforms(images)
         targets = convert_to_multiclass_targets(targets)
         if amp:
@@ -221,6 +234,15 @@ def evaluate(model, val_loader, batch_transforms, val_metric, args, amp=False, l
     return val_loss, recall, precision, mean_iou
 
 
+def _git_revision() -> str | None:
+    try:
+        import subprocess
+
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+
 def main(args):
     # Detect distributed setup
     # variable is set by torchrun
@@ -235,20 +257,14 @@ def main(args):
         dist.init_process_group(backend=args.backend, device_id=device)
 
     else:
-        # single process
+        # single process: CUDA index, "cuda[:N]", "mps" or "cpu"; default = CUDA > MPS > CPU
         rank = 0
-        if isinstance(args.device, int):
-            if not torch.cuda.is_available():
-                raise AssertionError("PyTorch cannot access your GPU. Please investigate!")
-            if args.device >= torch.cuda.device_count():
-                raise ValueError("Invalid device index")
-            device = torch.device("cuda", args.device)
-        # Silent default switch to GPU if available
-        elif torch.cuda.is_available():
-            device = torch.device("cuda", 0)
-        else:
+        device = resolve_device(args.device)
+        if device.type == "cpu":
             logging.warning("No accessible GPU, target device set to CPU.")  # noqa: LOG015
-            device = torch.device("cpu")
+    if args.amp and device.type != "cuda":
+        raise ValueError("--amp (automatic mixed precision) is only supported on CUDA devices")
+    use_cuda = device.type == "cuda"
 
     slack_token = os.getenv("TQDM_SLACK_TOKEN")
     slack_channel = os.getenv("TQDM_SLACK_CHANNEL")
@@ -265,7 +281,8 @@ def main(args):
     if not isinstance(args.workers, int):
         args.workers = min(16, multiprocessing.cpu_count())
 
-    torch.backends.cudnn.benchmark = True
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
     # placeholder for class names
     cls_container = [None]
     # validation dataset related code
@@ -329,7 +346,7 @@ def main(args):
         num_workers=args.workers,
         # Shard without padding so no sample is validated twice (see ShardSampler)
         sampler=ShardSampler(val_set, rank=rank) if distributed else SequentialSampler(val_set),
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_cuda,
         collate_fn=val_set.collate_fn,
     )
     if rank == 0:
@@ -349,6 +366,8 @@ def main(args):
             pretrained=args.pretrained,
             assume_straight_pages=not args.rotation,
             class_names=class_names,
+            # With exhaustive annotations a class without box in a page is a true negative, not "unannotated"
+            mask_empty_classes=not args.exhaustive_labels,
         )
 
     # Resume weights
@@ -363,9 +382,9 @@ def main(args):
         if rank == 0:
             pbar.write("Running evaluation")
         # Only moved further down, past this early return
-        if torch.cuda.is_available():
+        if use_cuda:
             torch.cuda.set_device(device)
-            model = model.to(device)
+        model = model.to(device)
         val_loss, recall, precision, mean_iou = evaluate(
             model, val_loader, batch_transforms, val_metric, args, amp=args.amp
         )
@@ -393,24 +412,28 @@ def main(args):
             T.ImageTorchvisionTransform(RandomGrayscale(p=0.15)),
         ]),
         T.ImageTorchvisionTransform(RandomPhotometricDistort(p=0.3)),
-        lambda x: x,  # Identity no transformation
+        identity,  # Identity no transformation
     ])
     # Image + target augmentations
+    # Horizontal flips produce mirrored text: harmless for generic word detection, useless (and misleading)
+    # when the classes are semantic fields of a form, hence `--no-hflip`
+    hflip = [] if args.no_hflip else [T.RandomHorizontalFlip(0.15)]
+    crop_scale = (args.crop_scale_min, 1.0)
     sample_transforms = T.SampleCompose(
         (
             [
-                T.RandomHorizontalFlip(0.15),
+                *hflip,
                 T.OneOf([
-                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
+                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=crop_scale), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
                 ]),
                 T.Resize((args.input_size, args.input_size), preserve_aspect_ratio=True, symmetric_pad=True),
             ]
             if not args.rotation
             else [
-                T.RandomHorizontalFlip(0.15),
+                *hflip,
                 T.OneOf([
-                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
+                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=crop_scale), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
                 ]),
                 # Rotation augmentation
@@ -432,6 +455,11 @@ def main(args):
         )
         with open(os.path.join(args.train_path, "labels.json"), "rb") as f:
             train_hash = hashlib.sha256(f.read()).hexdigest()
+        if train_set.class_names != class_names:
+            raise ValueError(
+                f"train and validation sets expose different classes: {train_set.class_names} vs {class_names}. "
+                "Every class must appear in both labels.json files (use an empty list for images without it)."
+            )
     else:
         # Built-in datasets: load the first one and extend it with the remaining ones
         train_datasets = args.train_datasets
@@ -467,7 +495,7 @@ def main(args):
         drop_last=True,
         num_workers=args.workers,
         sampler=sampler,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=use_cuda,
         collate_fn=train_set.collate_fn,
     )
     if rank == 0:
@@ -490,9 +518,9 @@ def main(args):
         for p in model.feat_extractor.parameters():
             p.requires_grad = False
 
-    if torch.cuda.is_available():
+    if use_cuda:
         torch.cuda.set_device(device)
-        model = model.to(device)
+    model = model.to(device)
 
     if distributed:
         # construct DDP model
@@ -562,6 +590,27 @@ def main(args):
             "rotation": args.rotation,
             "amp": args.amp,
         }
+
+    if rank == 0:
+        # Sidecar written next to every checkpoint: the contract needed to reload the model for inference
+        checkpoint_meta = {
+            "arch": args.arch,
+            "class_names": list(class_names),
+            "input_size": args.input_size,
+            "assume_straight_pages": not args.rotation,
+            "mask_empty_classes": not args.exhaustive_labels,
+            "train_hash": train_hash,
+            "val_hash": val_hash,
+            "git_revision": _git_revision(),
+            "torch_version": torch.__version__,
+            "doctr_version": doctr.__version__,
+            "args": dict(vars(args)),
+        }
+
+        def save_checkpoint(params: torch.nn.Module, stem: str) -> None:
+            torch.save(params.state_dict(), Path(args.output_dir) / f"{stem}.pt")
+            with open(Path(args.output_dir) / f"{stem}.json", "w", encoding="utf-8") as f:
+                json.dump(checkpoint_meta, f, indent=1, default=str)
 
     global global_step
     global_step = 0  # Shared global step counter
@@ -641,11 +690,11 @@ def main(args):
             params = model.module if hasattr(model, "module") else model
             if val_loss < min_loss:
                 pbar.write(f"Validation loss decreased {min_loss:.6} --> {val_loss:.6}: saving state...")
-                torch.save(params.state_dict(), Path(args.output_dir) / f"{exp_name}.pt")
+                save_checkpoint(params, exp_name)
                 min_loss = val_loss
             if args.save_interval_epoch:
                 pbar.write(f"Saving state at epoch: {epoch + 1}")
-                torch.save(params.state_dict(), Path(args.output_dir) / f"{exp_name}_epoch{epoch + 1}.pt")
+                save_checkpoint(params, f"{exp_name}_epoch{epoch + 1}")
 
             log_msg = f"Epoch {epoch + 1}/{args.epochs} - Validation loss: {val_loss:.6} "
             if any(val is None for val in (recall, precision, mean_iou)):
@@ -705,8 +754,9 @@ def parse_args():
     parser.add_argument(
         "--device",
         default=None,
-        type=int,
-        help="Specify gpu device for single-gpu training. In distributed setting, this parameter is ignored",
+        type=str,
+        help="Device for single-process training: a CUDA index (e.g. 0), 'cuda:N', 'mps' (Apple Silicon) or 'cpu'. "
+        "Default: CUDA if available, else MPS, else CPU. Ignored in distributed mode.",
     )
     parser.add_argument("arch", type=str, help="text-detection model to train")
     parser.add_argument("--output_dir", type=str, default=".", help="path to save checkpoints and final model")
@@ -756,6 +806,16 @@ def parse_args():
         help="Load pretrained parameters before starting the training",
     )
     parser.add_argument("--rotation", dest="rotation", action="store_true", help="train with rotated documents")
+    parser.add_argument(
+        "--exhaustive-labels",
+        action="store_true",
+        help="annotations are exhaustive: a class without any box in an image is trained as background instead of "
+        "being ignored (recommended for multi-class field/KIE detection)",
+    )
+    parser.add_argument("--no-hflip", action="store_true", help="disable the horizontal flip augmentation")
+    parser.add_argument(
+        "--crop-scale-min", type=float, default=0.75, help="minimum area ratio kept by the random crop augmentation"
+    )
     parser.add_argument(
         "--eval-straight",
         action="store_true",

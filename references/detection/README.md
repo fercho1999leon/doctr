@@ -19,6 +19,19 @@ You can start your training in PyTorch:
 python references/detection/train.py db_resnet50 --train_path path/to/your/train_set --val_path path/to/your/val_set --epochs 5
 ```
 
+### Device selection (CUDA, Apple Silicon MPS, CPU)
+
+`--device` accepts a CUDA index (`0`), `cuda:N`, `mps` (Apple Silicon GPU) or `cpu`. Without it the script picks CUDA, then MPS, then CPU. `--amp` is only supported on CUDA.
+
+```shell
+# NVIDIA GPU
+python references/detection/train.py db_resnet50 --train_path path/to/train --val_path path/to/val --device 0 --amp
+# Apple Silicon (set the fallback so the few ops MPS lacks run on CPU)
+PYTORCH_ENABLE_MPS_FALLBACK=1 python references/detection/train.py db_resnet50 --train_path path/to/train --val_path path/to/val --device mps
+```
+
+Every checkpoint `<name>.pt` is written together with a `<name>.json` sidecar (architecture, ordered class names, input size, target options, dataset hashes, git revision, versions and the full argument list). The inference and evaluation scripts below read the sidecar, so the class list never has to be typed by hand.
+
 Alternatively, instead of providing local folders you can train directly on one or several built-in datasets, which are downloaded automatically. When several are passed, the first one is loaded and extended with the others:
 
 ```shell
@@ -117,6 +130,66 @@ labels.json
     ...
 }
 ```
+
+Every class must appear in **every** `labels.json` (train and val) and, ideally, in every image entry: use an empty list for a class that has no box in a given image. The class → channel mapping is derived from the sorted set of class names, and the script aborts if train and val expose different classes.
+
+By default a class without any box in an image is *ignored* by the loss (the image may simply not be annotated for it). When your annotations are exhaustive, i.e. "no box" means "this field is not on the page", pass `--exhaustive-labels` so the absence is learnt as background: this is what you want for semantic fields (KIE).
+
+Two augmentation switches are useful for field detection: `--no-hflip` disables horizontal flips (mirrored text does not help when the classes are the fields of a form) and `--crop-scale-min` (default 0.75) controls how aggressive the random crop is; raise it if the audit shows large fields being cut.
+
+## Field (KIE) detection from Google Document AI exports
+
+The `convert_documentai.py`, `audit_crops.py`, `kie_inference.py` and `evaluate_fields.py` scripts turn a set of Document AI labelled documents (each JSON holding the page image in base64 plus the labelled entities) into a multi-class detection dataset, audit it, and extract/evaluate fields with the trained detector.
+
+### 1. Convert and audit the annotations
+
+```shell
+python references/detection/convert_documentai.py \
+  --input path/to/export_a path/to/export_b \
+  --output data/fields --val-ratio 0.2 --seed 42 \
+  --rename facha=fecha --drop numero_cuenta
+```
+
+- Decodes the embedded page image (format detected from the bytes), converts the normalised vertices to absolute pixels and writes `train/` and `val/` folders in the format above, with every class listed in every entry.
+- Near-duplicate pages (perceptual hash within `--dup-threshold`) are grouped and never split across train/val; exact duplicates are reported.
+- The split is stratified on the presence of each class at the group level (`--folds K --fold i` gives a grouped K-fold instead, useful to estimate the variance on small datasets). With a few dozen documents treat `val/` as a **development** set, not as an independent test set.
+- `manifest.json` (per split) keeps the provenance of every page and the annotated text of every box; `audit.json` lists boxes per class, multi-line and long texts, tiny boxes, cross-class overlaps and pages without boxes.
+
+```shell
+python references/detection/audit_crops.py --data data/fields/val
+```
+
+draws the ground-truth polygons on a few pages (`val/audit_viz/`) and runs the pretrained recognisers on the ground-truth crops, reporting the exact-match rate per class. It tells you, before any training, which fields cannot be read as a single crop (multi-line blocks, texts longer than PARSeq's 32 characters, characters missing from the recogniser vocabulary such as `ñ` with the default French vocab).
+
+### 2. Train
+
+```shell
+PYTORCH_ENABLE_MPS_FALLBACK=1 python references/detection/train.py db_resnet50 --pretrained \
+  --train_path data/fields/train --val_path data/fields/val \
+  --device mps -b 2 --epochs 60 --lr 1e-3 --sched cosine --no-hflip --exhaustive-labels \
+  --early-stop --early-stop-epochs 10 --output_dir runs --name db_resnet50_fields
+```
+
+Run a short pilot (5 epochs) and look at the field-level report before launching the full run. On an NVIDIA machine use `--device 0 --amp -b 4` (or `torchrun` as above).
+
+### 3. Extract fields
+
+```shell
+python references/detection/kie_inference.py --checkpoint runs/db_resnet50_fields.pt page.jpg --json out.json
+```
+
+The detector localises the field regions; the text is read by the standard `ocr_predictor` and its words are assigned to each region by their centre (`--reco-mode words`, default). This handles multi-line and long fields, which `kie_predictor` (one recognition per region, `--reco-mode kie`) cannot. The output is `{class: [{"value", "confidence", "detection_score", "geometry", "words"}]}`; a class without detection maps to an empty list. When every field occurs at most once per page, `--top-k-per-class 1` keeps only the best-scored region per class, which removes most false positives; `--bin-thresh` / `--box-thresh` override the detector thresholds (tune them with `evaluate_fields.py`).
+
+### 4. Evaluate per field
+
+```shell
+python references/detection/evaluate_fields.py --checkpoint runs/db_resnet50_fields.pt --data data/fields/val \
+  --required valor_transferido fecha cuenta_destino numero_comprobante
+```
+
+reports, per class and matched by name: detection precision/recall/F1 at `--iou` (default 0.5), the false-positive rate on documents where the field is absent, the exact match of the read text against the annotation (Unicode NFKC, upper-case, whitespace collapsed; currency symbols and separators removed for amounts) and the share of documents where every required field is correct. A Markdown and a JSON report are written next to the data.
+
+The pretrained recognition weights use the French vocabulary, which lacks `ñ` and Spanish accents; fine-tuning a recogniser with `VOCABS["spanish"]` (see `references/recognition`) is the natural next step once detection is solid.
 
 ## Slack Logging with tqdm
 
