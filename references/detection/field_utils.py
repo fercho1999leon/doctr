@@ -28,6 +28,8 @@ __all__ = [
     "resolve_device",
     "FieldExtractor",
     "extract_key",
+    "keys_match",
+    "parse_min_score",
 ]
 
 
@@ -55,6 +57,17 @@ def resolve_device(device: str | int | None) -> torch.device:
     if dev.type == "mps" and not torch.backends.mps.is_available():
         raise AssertionError("MPS backend is not available on this machine.")
     return dev
+
+
+def parse_min_score(items: list[str] | None) -> dict[str, float]:
+    """Parse `--min-score cls=0.6 other=0.4` CLI values."""
+    out: dict[str, float] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(f"--min-score expects CLASS=VALUE, got '{item}'")
+        cls_name, value = item.split("=", 1)
+        out[cls_name.strip()] = float(value)
+    return out
 
 
 def load_manifest(split_dir: str | Path) -> dict:
@@ -214,6 +227,7 @@ class FieldExtractor:
         bin_thresh: float | None = None,
         box_thresh: float | None = None,
         top_k_per_class: int | None = None,
+        min_score: dict[str, float] | None = None,
     ) -> None:
         from doctr.models import detection_predictor, kie_predictor, ocr_predictor
 
@@ -224,6 +238,8 @@ class FieldExtractor:
         # A receipt holds at most one value per field: keeping the k best-scored regions per class removes
         # most false positives without retraining
         self.top_k_per_class = top_k_per_class
+        # Per-class minimum detection score (tune it with `evaluate_fields.py --tune-thresholds`)
+        self.min_score = dict(min_score or {})
         self.device = device
         model, self.cfg = load_detection_checkpoint(checkpoint, device)
         size = input_size or self.cfg.get("input_size") or model.cfg["input_shape"][-1]
@@ -261,6 +277,10 @@ class FieldExtractor:
                 else:
                     order = np.arange(len(boxes))
                 boxes = boxes[order]
+                thr = self.min_score.get(cls_name)
+                if thr is not None and len(boxes):
+                    scores = boxes[:, 4] if boxes.ndim == 2 else boxes[:, 4, 0]
+                    boxes = boxes[scores >= thr]
                 if self.top_k_per_class is not None:
                     boxes = boxes[: self.top_k_per_class]
                 kept[cls_name] = boxes
@@ -332,17 +352,20 @@ _MONTHS_ES = {
     "diciembre": 12, "jan": 1, "apr": 4, "aug": 8, "dec": 12,
 }  # fmt: skip
 _MONTH_RE = "|".join(sorted(_MONTHS_ES, key=len, reverse=True))
+_SEP = r"(?:\s|[-/.,:])*"  # loose separators the OCR leaves between date tokens
 _DATE_PATTERNS = [
-    # 16 de septiembre de 2026 / 16 sept 2026 / 16-sep-2026 / E116 de septiembre de 2026 (OCR glued "El")
-    re.compile(rf"(\d{{1,2}})\s*[-/.]?\s*(?:de\s*)?({_MONTH_RE})\.?\s*[-/.]?\s*(?:de\s*)?(\d{{4}})", re.I),
+    # 16 de septiembre de 2026 / 16 sept 2026 / 16-sep-2026 / E116 de septiembre de - 2026 (OCR glued "El")
+    re.compile(rf"(\d{{1,2}}){_SEP}(?:de)?{_SEP}({_MONTH_RE}){_SEP}(?:de)?{_SEP}(\d{{4}})", re.I),
     # 2026/ago./26 / 2026-sep-16
-    re.compile(rf"(\d{{4}})\s*[-/.]\s*({_MONTH_RE})\.?\s*[-/.]\s*(\d{{1,2}})", re.I),
+    re.compile(rf"(\d{{4}}){_SEP}({_MONTH_RE}){_SEP}(\d{{1,2}})", re.I),
     # 2026/09/16 / 2026-09-16
     re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"),
     # 16/09/2026 / 16-09-2026 / 16.09.26
     re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})"),
 ]
-_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?")
+# 14:22, 14:22:40, 08.23:17 (OCR), possibly glued to the date: searched right after the date first
+_TIME_AFTER_RE = re.compile(r"\s*(\d{1,2})[:.](\d{2})(?:[:.]\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?", re.I)
+_TIME_ANY_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?", re.I)
 _PREFIX_RE = re.compile(r"^(?:n[o°º]\.?|nro\.?|num(?:ero)?\.?|#|comprobante|control|ref\.?)\s*:?\s*", re.I)
 
 
@@ -369,9 +392,15 @@ def _key_fecha(text: str) -> str:
         except (KeyError, ValueError):
             continue
         key = f"{year:04d}-{month:02d}-{day:02d}"
-        tm = _TIME_RE.search(t)
-        if tm and 0 <= int(tm.group(1)) < 24:
-            key += f" {int(tm.group(1)):02d}:{tm.group(2)}"
+        tm = _TIME_AFTER_RE.match(t, m.end()) or _TIME_ANY_RE.search(t)
+        if tm:
+            hour, minute, ampm = int(tm.group(1)), tm.group(2), (tm.group(3) or "").replace(".", "")
+            if ampm == "pm" and hour < 12:
+                hour += 12
+            if ampm == "am" and hour == 12:
+                hour = 0
+            if 0 <= hour < 24 and int(minute) < 60:
+                key += f" {hour:02d}:{minute}"
         return key
     return ""
 
@@ -428,6 +457,25 @@ _KEY_EXTRACTORS = {
     "cuenta_destino": _key_account,
     "nombre_cuenta_origen": _key_name,
 }
+
+
+def keys_match(field: str, gt_key: str, pred_key: str) -> bool:
+    """Whether two canonical keys denote the same value.
+
+    - masked accounts: one digit suffix must end with the other (`3861` vs `61`, `X` read as `0`)
+    - names: fuzzy ratio >= 0.9 on the letters (tolerates one misread character, not a different person)
+    - everything else: exact
+    """
+    if not gt_key or not pred_key:
+        return False
+    if field == "cuenta_destino":
+        short, long_ = sorted((gt_key, pred_key), key=len)
+        return len(short) >= 2 and long_.endswith(short)
+    if field == "nombre_cuenta_origen":
+        from rapidfuzz.distance import Levenshtein
+
+        return Levenshtein.normalized_similarity(gt_key, pred_key) >= 0.9
+    return gt_key == pred_key
 
 
 def extract_key(field: str, text: str) -> str:

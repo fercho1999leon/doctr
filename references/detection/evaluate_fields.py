@@ -29,8 +29,10 @@ from field_utils import (
     FieldExtractor,
     box_iou,
     extract_key,
+    keys_match,
     load_manifest,
     normalize_text,
+    parse_min_score,
     polygon_to_box,
     resolve_device,
 )
@@ -62,6 +64,8 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
     text = {c: {"n": 0, "exact": 0, "exact_nospace": 0, "key": 0} for c in class_names}
     docs_all_required, docs_all_required_key, n_docs = 0, 0, 0
     per_doc = []
+    # Per class and document: (score of the best-scored prediction or None, has ground truth, best pred matches)
+    sweep: dict[str, list[tuple[float | None, bool, bool]]] = {c: [] for c in class_names}
 
     for doc in manifest["documents"]:
         n_docs += 1
@@ -88,6 +92,13 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 if preds:
                     absent[c]["docs_with_fp"] += 1
             matched_pred = dict(matches)
+            best = max(preds, key=lambda p: p["detection_score"] or 0.0) if preds else None
+            best_idx = preds.index(best) if best is not None else None
+            sweep[c].append((
+                best["detection_score"] if best is not None else None,
+                bool(gts),
+                best_idx is not None and best_idx in matched_pred.values(),
+            ))
             field_ok = field_key_ok = len(gts) == len(preds)  # no missing, no extra
             entries = []
             for gi, gt in enumerate(gts):
@@ -96,7 +107,7 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 gt_norm, pred_norm = normalize_text(gt["text"], c), normalize_text(pred_value, c)
                 exact = gt_norm == pred_norm
                 gt_key, pred_key = extract_key(c, gt["text"]), extract_key(c, pred_value)
-                key_ok = bool(gt_key) and gt_key == pred_key
+                key_ok = keys_match(c, gt_key, pred_key)
                 text[c]["exact"] += int(exact)
                 text[c]["exact_nospace"] += int(gt_norm.replace(" ", "") == pred_norm.replace(" ", ""))
                 text[c]["key"] += int(key_ok)
@@ -154,9 +165,16 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 "key_match": text[c]["key"] / text[c]["n"] if text[c]["n"] else None,
             },
         }
+    thresholds = tune_thresholds(sweep)
+    for c in class_names:
+        summary[c]["threshold"] = thresholds[c]
+
     return {
         "n_docs": n_docs,
         "iou_threshold": iou_thresh,
+        "suggested_min_score": {
+            c: t["best_threshold"] for c, t in thresholds.items() if t["best_threshold"] is not None
+        },
         "required_fields": required,
         "docs_all_required_ok": docs_all_required,
         "docs_all_required_ok_ratio": docs_all_required / n_docs if n_docs else None,
@@ -165,6 +183,29 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
         "per_class": summary,
         "per_document": per_doc,
     }
+
+
+def tune_thresholds(sweep: dict[str, list[tuple[float | None, bool, bool]]]) -> dict[str, dict]:
+    """For each class, sweep a minimum detection score for the best-scored region of every document and keep the
+    value maximising F1 (a document without ground truth where a region survives the threshold counts as a false
+    positive). Exact for `--top-k-per-class 1`, an approximation otherwise."""
+    out = {}
+    for c, rows in sweep.items():
+        candidates = sorted({round(s, 3) for s, _, _ in rows if s is not None} | {0.0})
+        best = {"best_threshold": None, "f1": None, "precision": None, "recall": None, "f1_at_zero": None}
+        for t in candidates:
+            tp = sum(1 for s, gt, ok in rows if s is not None and s >= t and gt and ok)
+            fp = sum(1 for s, gt, ok in rows if s is not None and s >= t and not (gt and ok))
+            fn = sum(1 for s, gt, ok in rows if gt and not (s is not None and s >= t and ok))
+            p = tp / (tp + fp) if tp + fp else 0.0
+            r = tp / (tp + fn) if tp + fn else 0.0
+            f1 = 2 * p * r / (p + r) if p + r else 0.0
+            if t == 0.0:
+                best["f1_at_zero"] = f1
+            if best["f1"] is None or f1 > best["f1"] + 1e-9:
+                best.update({"best_threshold": t, "f1": f1, "precision": p, "recall": r})
+        out[c] = best
+    return out
 
 
 def fmt(v, pct=True):
@@ -223,7 +264,7 @@ def recommendations(report: dict, iou_thresh: float) -> tuple[str, list[str]]:
         if fp_absent is not None and fp_absent > 0.3 and s["absent_docs"] >= 3:
             recs.append(
                 f"`{c}`: predicted on {fp_absent:.0%} of the {s['absent_docs']} documents where it is absent; "
-                "train with `--exhaustive-labels` (absence learnt as background) and raise `--box-thresh`."
+                "apply the suggested `--min-score` for this class (see the thresholds table)."
             )
         key = t.get("key_match")
         if d["recall"] is not None and d["recall"] >= 0.7 and key is not None and key < 0.7:
@@ -270,6 +311,20 @@ def to_markdown(report: dict, title: str) -> str:
         f"as exact text, **{report['docs_all_required_key_ok']} / {report['n_docs']}** "
         f"({fmt(report['docs_all_required_key_ok_ratio'])}) as canonical keys"
     )
+    tuned = {c: s["threshold"] for c, s in report["per_class"].items() if s.get("threshold")}
+    if tuned:
+        lines += ["", "## Suggested minimum detection score per class (tuned on this split)", ""]
+        lines.append("| class | min score | F1 with it | P | R | F1 without |")
+        lines.append("|---|---|---|---|---|---|")
+        for c, t in tuned.items():
+            if t["best_threshold"] is None:
+                continue
+            lines.append(
+                f"| {c} | {t['best_threshold']:.2f} | {fmt(t['f1'])} | {fmt(t['precision'])} | {fmt(t['recall'])} | "
+                f"{fmt(t['f1_at_zero'])} |"
+            )
+        flags = " ".join(f"{c}={t['best_threshold']:.2f}" for c, t in tuned.items() if t["best_threshold"])
+        lines += ["", f"Apply with: `--min-score {flags}` (in `evaluate_fields.py` and `kie_inference.py`)."]
     lines += ["", "## Diagnosis", "", report["diagnosis"], "", "## Recommendations", ""]
     lines += [f"{i}. {r}" for i, r in enumerate(report["recommendations"], 1)] or ["Nothing to report."]
     return "\n".join(lines) + "\n"
@@ -290,6 +345,7 @@ def main(args):
         bin_thresh=args.bin_thresh,
         box_thresh=args.box_thresh,
         top_k_per_class=args.top_k_per_class,
+        min_score=parse_min_score(args.min_score),
     )
     unknown = [c for c in args.required if c not in manifest["class_names"]]
     if unknown:
@@ -297,6 +353,7 @@ def main(args):
     report = evaluate(manifest, data_dir, extractor, args.iou, args.required)
     report["checkpoint"] = str(args.checkpoint)
     report["top_k_per_class"] = args.top_k_per_class
+    report["min_score"] = parse_min_score(args.min_score)
     report["diagnosis"], report["recommendations"] = recommendations(report, args.iou)
     report["reco_mode"] = args.reco_mode
     report["reco_arch"] = args.reco_arch
@@ -337,6 +394,13 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--min-score",
+        nargs="*",
+        default=None,
+        metavar="CLASS=VALUE",
+        help="per-class minimum detection score, e.g. numero_control=0.62 (the report suggests values)",
     )
     parser.add_argument("--device", default=None, help="cpu, mps, cuda, cuda:N or a CUDA index (default: auto)")
     parser.add_argument("--output", default=None, help="output path without extension (.json and .md are written)")

@@ -20,7 +20,7 @@ import argparse
 import json
 import sys
 
-from field_utils import FieldExtractor, resolve_device
+from field_utils import FieldExtractor, parse_min_score, resolve_device
 
 from doctr.io import DocumentFile
 
@@ -38,6 +38,7 @@ def main(args):
         bin_thresh=args.bin_thresh,
         box_thresh=args.box_thresh,
         top_k_per_class=args.top_k_per_class,
+        min_score=parse_min_score(args.min_score),
     )
     results = {}
     for path in args.images:
@@ -86,6 +87,13 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--min-score",
+        nargs="*",
+        default=None,
+        metavar="CLASS=VALUE",
+        help="per-class minimum detection score, e.g. numero_control=0.62 (tune with evaluate_fields.py)",
     )
     parser.add_argument("--device", default=None, help="cpu, mps, cuda, cuda:N or a CUDA index (default: auto)")
     parser.add_argument("--json", default=None, help="write the results to this JSON file")
