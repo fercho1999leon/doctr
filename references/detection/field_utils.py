@@ -413,9 +413,14 @@ class FieldExtractor:
                 for entry in entries:
                     entry["source"] = "detector"
                 # Fallback when the detector found nothing, only regions whose text yields no usable value, or
-                # (destination account) a region without a masked account number, e.g. another number on the page
+                # (destination account) a region holding some other number (RUC, amount) instead of a masked
+                # account; a name-only region (no digit at all) is a legitimate reading and is kept
                 untrusted = not any(e["normalized"] for e in entries) or (
-                    cls_name == "cuenta_destino" and not any(account_value_is_valid(e["value"]) for e in entries)
+                    cls_name == "cuenta_destino"
+                    and not any(
+                        account_value_is_valid(e["value"]) or not any(ch.isdigit() for ch in e["value"])
+                        for e in entries
+                    )
                 )
                 if self.fallback and untrusted:
                     hit = find_fallback(cls_name, lines)
