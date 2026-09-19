@@ -59,6 +59,18 @@ def convert_to_multiclass_targets(targets: list) -> list[dict[str, np.ndarray]]:
     return [target if isinstance(target, dict) else {CLASS_NAME: target} for target in targets]
 
 
+AMP_DTYPE = torch.float16  # overridden by --amp-dtype
+
+
+def _autocast():
+    return torch.amp.autocast("cuda", dtype=AMP_DTYPE)
+
+
+def _scaler():
+    # bfloat16 has the range of float32: no loss scaling needed (and GradScaler only makes sense for float16)
+    return torch.amp.GradScaler("cuda", enabled=AMP_DTYPE == torch.float16)
+
+
 def identity(x):
     """No-op augmentation (a module-level function so DataLoader workers can pickle it on macOS/Windows)."""
     return x
@@ -97,7 +109,7 @@ def record_lr(
     loss_recorder = []
 
     if amp:
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = _scaler()
 
     device = _model_device(model)
     for batch_idx, (images, targets) in enumerate(train_loader):
@@ -109,7 +121,7 @@ def record_lr(
         # Forward, Backward & update
         optimizer.zero_grad()
         if amp:
-            with torch.amp.autocast("cuda"):
+            with _autocast():
                 train_loss = model(images, targets)["loss"]
             scaler.scale(train_loss).backward()
             # Gradient clipping
@@ -142,7 +154,7 @@ def record_lr(
 
 def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, amp=False, log=None, rank=0):
     if amp:
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = _scaler()
 
     model.train()
     # Iterate over the batches of the dataset
@@ -156,7 +168,7 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, a
 
         optimizer.zero_grad()
         if amp:
-            with torch.amp.autocast("cuda"):
+            with _autocast():
                 train_loss = model(images, targets)["loss"]
             scaler.scale(train_loss).backward()
             # Gradient clipping
@@ -204,7 +216,7 @@ def evaluate(model, val_loader, batch_transforms, val_metric, args, amp=False, l
         images = batch_transforms(images)
         targets = convert_to_multiclass_targets(targets)
         if amp:
-            with torch.amp.autocast("cuda"):
+            with _autocast():
                 out = model(images, targets, return_preds=True)
         else:
             out = model(images, targets, return_preds=True)
@@ -244,6 +256,8 @@ def _git_revision() -> str | None:
 
 
 def main(args):
+    global AMP_DTYPE
+    AMP_DTYPE = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
     # Detect distributed setup
     # variable is set by torchrun
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -827,6 +841,12 @@ def parse_args():
         "--sched", type=str, default="poly", choices=["cosine", "onecycle", "poly"], help="scheduler to use"
     )
     parser.add_argument("--amp", dest="amp", help="Use Automatic Mixed Precision", action="store_true")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="autocast dtype for --amp; bfloat16 (Ampere+ GPUs) avoids float16 overflows, e.g. in DETR matching",
+    )
     parser.add_argument("--find-lr", action="store_true", help="Gridsearch the optimal LR")
     parser.add_argument("--early-stop", action="store_true", help="Enable early stopping")
     parser.add_argument("--early-stop-epochs", type=int, default=5, help="Patience for early stopping")

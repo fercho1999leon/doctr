@@ -21,7 +21,7 @@ python references/detection/train.py db_resnet50 --train_path path/to/your/train
 
 ### Device selection (CUDA, Apple Silicon MPS, CPU)
 
-`--device` accepts a CUDA index (`0`), `cuda:N`, `mps` (Apple Silicon GPU) or `cpu`. Without it the script picks CUDA, then MPS, then CPU. `--amp` is only supported on CUDA.
+`--device` accepts a CUDA index (`0`), `cuda:N`, `mps` (Apple Silicon GPU) or `cpu`. Without it the script picks CUDA, then MPS, then CPU. `--amp` is only supported on CUDA; `--amp-dtype bfloat16` (Ampere or newer GPUs) avoids float16 overflows and needs no loss scaling. Use it for LW-DETR, whose Hungarian matching overflows in float16.
 
 ```shell
 # NVIDIA GPU
