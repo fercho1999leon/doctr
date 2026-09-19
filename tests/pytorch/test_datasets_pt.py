@@ -1065,3 +1065,18 @@ def test_detection_dataset_multiclass_missing_classes(mock_image_folder, tmpdir_
     images, targets = next(iter(loader))
     assert images.shape == (4, 3, 512, 512)
     assert all(list(t.keys()) == ["a", "b"] for t in targets)
+
+
+def test_layout_dataset_empty_image(mock_image_folder, tmpdir_factory):
+    # An image without any region is a valid all-background sample and must expose every class
+    poly = [[[10, 20], [60, 20], [60, 40], [10, 40]]]
+    labels = {
+        "mock_image_file_0.jpeg": {"img_dimensions": (800, 600), "img_hash": "h", "polygons": poly, "classes": ["a"]},
+        "mock_image_file_1.jpeg": {"img_dimensions": (800, 600), "img_hash": "h", "polygons": [], "classes": []},
+    }
+    label_path = tmpdir_factory.mktemp("labels_layout_empty").join("labels.json")
+    with open(label_path, "w") as f:
+        json.dump(labels, f)
+    ds = datasets.LayoutDataset(img_folder=mock_image_folder, label_path=str(label_path))
+    assert ds.class_names == ["a"]
+    assert ds[1].target["a"].shape == (0, 4)
