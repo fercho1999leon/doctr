@@ -152,3 +152,6 @@ docs/ENTRENAMIENTO/
 *.pth
 *.onnx
 runs/
+
+# Local inference outputs (contain receipt data)
+salida*.json
