@@ -27,6 +27,7 @@ __all__ = [
     "load_detection_checkpoint",
     "resolve_device",
     "FieldExtractor",
+    "account_value_is_valid",
     "extract_key",
     "extract_time",
     "find_fallback",
@@ -411,8 +412,12 @@ class FieldExtractor:
             for cls_name, entries in fields.items():
                 for entry in entries:
                     entry["source"] = "detector"
-                # Fallback when the detector found nothing, or only regions whose text yields no usable value
-                if self.fallback and not any(e["normalized"] for e in entries):
+                # Fallback when the detector found nothing, only regions whose text yields no usable value, or
+                # (destination account) a region without a masked account number, e.g. another number on the page
+                untrusted = not any(e["normalized"] for e in entries) or (
+                    cls_name == "cuenta_destino" and not any(account_value_is_valid(e["value"]) for e in entries)
+                )
+                if self.fallback and untrusted:
                     hit = find_fallback(cls_name, lines)
                     if hit is not None:
                         fields[cls_name] = [hit]
@@ -529,16 +534,31 @@ def _key_number(text: str) -> str:
     return max(tokens, key=len).upper()
 
 
-def _key_account(text: str) -> str:
-    """Last run of digits: masked accounts (****3861, 21XXXXXXX61) are only identified by their suffix."""
-    runs = re.findall(r"\d+", text)
-    return runs[-1] if runs else ""
-
-
 def _key_name(text: str) -> str:
     t = unicodedata.normalize("NFKD", text)
     t = "".join(ch for ch in t if not unicodedata.combining(ch))
     return re.sub(r"[^A-Z]", "", t.upper())
+
+
+# ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR) / 21...61 / 21.61
+_MASKED_ACCOUNT_RE = re.compile(r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}[xX*0.]{2,}\d{2,4}\b|\b\d{2,3}\.{1,}\d{2}\b)")
+
+
+def _key_account(text: str) -> str:
+    """Digit suffix of the masked account (****3861 -> 3861, 21XXXXXXX61 -> 61), preferring a masked token over
+    any other number on the line (RUC, amount). Without digits (name-only annotation) the letters of the name."""
+    m = _MASKED_ACCOUNT_RE.search(text)
+    if m:
+        return re.findall(r"\d+", m.group(0))[-1]
+    runs = re.findall(r"\d+", text)
+    if runs:
+        return runs[-1]
+    return _key_name(text)
+
+
+def account_value_is_valid(text: str) -> bool:
+    """A destination-account value is trusted only when it holds a masked account number."""
+    return bool(_MASKED_ACCOUNT_RE.search(text or ""))
 
 
 _KEY_EXTRACTORS = {
@@ -555,7 +575,7 @@ _KEY_EXTRACTORS = {
 # Receipts are highly regular, so a pattern hit is almost always the right value.
 _FALLBACK_LINE_PATTERNS: dict[str, re.Pattern] = {
     # ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR)
-    "cuenta_destino": re.compile(r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}[xX*0]{3,}\d{2,4}\b)"),
+    "cuenta_destino": _MASKED_ACCOUNT_RE,
     "numero_comprobante": re.compile(
         r"(?:n[o°º]\.?|nro\.?|comprobante|documento|referencia|ref\.?)\s*:?\s*([A-Z0-9]{6,})", re.I
     ),
@@ -608,6 +628,12 @@ def keys_match(field: str, gt_key: str, pred_key: str) -> bool:
     if not gt_key or not pred_key:
         return False
     if field == "cuenta_destino":
+        if not (gt_key.isdigit() and pred_key.isdigit()):
+            # name-only annotation (or reading): compare the letters, allow one misread character
+            from rapidfuzz.distance import Levenshtein
+
+            a, b = _key_name(gt_key), _key_name(pred_key)
+            return bool(a) and bool(b) and Levenshtein.normalized_similarity(a, b) >= 0.9
         short, long_ = sorted((gt_key, pred_key), key=len)
         return len(short) >= 2 and long_.endswith(short)
     if field == "nombre_cuenta_origen":
