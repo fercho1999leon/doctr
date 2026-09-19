@@ -541,7 +541,9 @@ def _key_name(text: str) -> str:
 
 
 # ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR) / 21...61 / 21.61
-_MASKED_ACCOUNT_RE = re.compile(r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}[xX*0.]{2,}\d{2,4}\b|\b\d{2,3}\.{1,}\d{2}\b)")
+_MASKED_ACCOUNT_RE = re.compile(
+    r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}(?=[xX*0.]*[xX*.])[xX*0.]{2,}\d{2,4}\b|\b\d{2,3}\.{1,}\d{2}\b)"
+)
 
 
 def _key_account(text: str) -> str:
