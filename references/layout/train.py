@@ -440,26 +440,44 @@ def main(args):
     st = time.time()
     # Augmentations
     # Image augmentations
-    img_transforms = T.OneOf([
-        Compose([
-            T.RandomApply(T.ColorInversion(), 0.3),
-            T.RandomApply(T.GaussianBlur(sigma=(0.5, 1.5)), 0.2),
-        ]),
-        Compose([
-            T.RandomApply(T.RandomShadow(), 0.3),
-            T.RandomApply(T.GaussianNoise(), 0.1),
-            T.RandomApply(T.GaussianBlur(sigma=(0.5, 1.5)), 0.3),
-            T.ImageTorchvisionTransform(RandomGrayscale(p=0.15)),
-        ]),
-        T.ImageTorchvisionTransform(RandomPhotometricDistort(p=0.3)),
-        identity,  # Identity no transformation
-    ])
+    img_transforms = T.OneOf(
+        [
+            Compose([
+                T.RandomApply(T.ColorInversion(), 0.3),
+                T.RandomApply(T.GaussianBlur(sigma=(0.5, 1.5)), 0.2),
+            ]),
+            Compose([
+                T.RandomApply(T.RandomShadow(), 0.3),
+                T.RandomApply(T.GaussianNoise(), 0.1),
+                T.RandomApply(T.GaussianBlur(sigma=(0.5, 1.5)), 0.3),
+                T.ImageTorchvisionTransform(RandomGrayscale(p=0.15)),
+            ]),
+            T.ImageTorchvisionTransform(RandomPhotometricDistort(p=0.3)),
+            identity,  # Identity no transformation
+        ]
+        + (
+            [
+                # Photographed pages: specular reflections, uneven lighting / crumpled shading, shadows, blur
+                Compose([
+                    T.RandomApply(T.RandomGlare(), 0.6),
+                    T.RandomApply(T.RandomLighting(), 0.8),
+                    T.RandomApply(T.RandomShadow(), 0.3),
+                    T.RandomApply(T.GaussianBlur(sigma=(0.5, 2.0)), 0.3),
+                ])
+            ]
+            if args.photo_aug
+            else []
+        )
+    )
     # Image + target augmentations
     hflip = [] if args.no_hflip else [T.RandomHorizontalFlip(0.15)]
+    # Perspective: the page photographed at an angle (boxes are warped alongside)
+    perspective = [T.RandomApply(T.RandomPerspective(args.perspective), 0.4)] if args.perspective > 0 else []
     sample_transforms = T.SampleCompose(
         (
             [
                 *hflip,
+                *perspective,
                 T.OneOf([
                     T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
@@ -474,6 +492,7 @@ def main(args):
             if not args.rotation
             else [
                 *hflip,
+                *perspective,
                 T.OneOf([
                     T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
@@ -873,6 +892,17 @@ def parse_args():
     )
     parser.add_argument("--rotation", dest="rotation", action="store_true", help="train with rotated documents")
     parser.add_argument("--no-hflip", action="store_true", help="disable the horizontal flip augmentation")
+    parser.add_argument(
+        "--perspective",
+        type=float,
+        default=0.0,
+        help="max relative corner displacement of a random perspective warp (photographed pages), e.g. 0.2; 0 = off",
+    )
+    parser.add_argument(
+        "--photo-aug",
+        action="store_true",
+        help="add photo-like photometric augmentations (glare, uneven lighting, shadows, blur)",
+    )
     parser.add_argument(
         "--labels-name",
         default="labels.json",

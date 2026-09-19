@@ -92,7 +92,7 @@ class DetectionDataset(AbstractDataset):
         elif isinstance(polygons, dict):
             self._class_names += list(polygons.keys())
             polygons_classes = [k for k, v in polygons.items() for _ in v]
-            arrays = [np.asarray(poly, dtype=np_dtype) for poly in polygons.values() if poly]
+            arrays: list[np.ndarray] = [np.asarray(poly, dtype=np_dtype) for poly in polygons.values() if poly]
             _polygons = (
                 np.concatenate(arrays, axis=0) if arrays else np.zeros((0, 4, 2), dtype=np_dtype)
             )  # image without any box

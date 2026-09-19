@@ -135,6 +135,8 @@ Every class must appear in **every** `labels.json` (train and val) and, ideally,
 
 By default a class without any box in an image is *ignored* by the loss (the image may simply not be annotated for it). When your annotations are exhaustive, i.e. "no box" means "this field is not on the page", pass `--exhaustive-labels` so the absence is learnt as background: this is what you want for semantic fields (KIE).
 
+For pages that will be **photographed** rather than screenshotted or scanned, two switches add the corresponding augmentations: `--perspective 0.2` warps the page (and its boxes) as if photographed at an angle, up to 20 % corner displacement, and `--photo-aug` adds specular reflections (`RandomGlare`), uneven lighting and crumpled-sheet shading (`RandomLighting`), shadows and blur. Synthetic augmentation improves robustness but does not replace real photographs in the training set.
+
 Two augmentation switches are useful for field detection: `--no-hflip` disables horizontal flips (mirrored text does not help when the classes are the fields of a form) and `--crop-scale-min` (default 0.75) controls how aggressive the random crop is; raise it if the audit shows large fields being cut.
 
 ## Field (KIE) detection from Google Document AI exports
