@@ -41,6 +41,7 @@ def main(args):
         min_score=parse_min_score(args.min_score),
         merge_fragments=args.merge_fragments,
         fallback=args.fallback,
+        straighten=args.straighten,
     )
     results = {}
     for path in args.images:
@@ -48,7 +49,8 @@ def main(args):
         page_results = extractor(pages)
         results[path] = page_results[0] if len(page_results) == 1 else page_results
         if not args.quiet:
-            print(f"\n== {path} ==")
+            angle = extractor.last_angles[0] if extractor.last_angles else 0
+            print(f"\n== {path} ==" + (f" (rotated {angle} deg)" if angle else ""))
             fields = page_results[0] if len(page_results) == 1 else page_results[0]
             for cls_name in extractor.class_names:
                 values = fields.get(cls_name, [])
@@ -92,6 +94,11 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--straighten",
+        action="store_true",
+        help="rotate photos/scans upright before detection (page orientation classifier + text line skew)",
     )
     parser.add_argument(
         "--fallback",

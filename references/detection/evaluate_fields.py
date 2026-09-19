@@ -366,6 +366,7 @@ def main(args):
         min_score=parse_min_score(args.min_score),
         merge_fragments=args.merge_fragments,
         fallback=args.fallback,
+        straighten=args.straighten,
     )
     unknown = [c for c in args.required if c not in manifest["class_names"]]
     if unknown:
@@ -416,6 +417,11 @@ def parse_args():
         type=int,
         default=None,
         help="keep only the k best-scored regions per class (use 1 when every field occurs at most once per page)",
+    )
+    parser.add_argument(
+        "--straighten",
+        action="store_true",
+        help="rotate photos/scans upright before detection (page orientation classifier + text line skew)",
     )
     parser.add_argument(
         "--fallback",

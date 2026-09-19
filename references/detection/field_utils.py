@@ -266,8 +266,9 @@ class FieldExtractor:
         min_score: dict[str, float] | None = None,
         merge_fragments: bool = False,
         fallback: bool = False,
+        straighten: bool = False,
     ) -> None:
-        from doctr.models import detection_predictor, kie_predictor, ocr_predictor
+        from doctr.models import detection_predictor, kie_predictor, ocr_predictor, page_orientation_predictor
 
         if mode not in ("words", "kie"):
             raise ValueError("mode must be 'words' or 'kie'")
@@ -281,6 +282,10 @@ class FieldExtractor:
         self.merge_fragments = merge_fragments
         # Pattern search over the page when the detector returns nothing for a field (words mode only)
         self.fallback = fallback
+        # Rotate photos / scans upright before detection: coarse 0/90/180/270 from doctr's page orientation
+        # classifier, refined with the skew of the text lines (same recipe as ocr_predictor(straighten_pages=True))
+        self.straighten = straighten
+        self.page_orientation = page_orientation_predictor(pretrained=True).to(device) if straighten else None
         self.device = device
         from doctr.models import layout_predictor
 
@@ -313,6 +318,31 @@ class FieldExtractor:
         else:
             self.kie = kie_predictor(det_arch=model, reco_arch=reco_arch, pretrained=True, assume_straight_pages=True)
             self.kie = self.kie.to(device)
+
+    @torch.no_grad()
+    def straighten_pages(self, pages: list[np.ndarray]) -> tuple[list[np.ndarray], list[int]]:
+        """Return the pages rotated upright and the applied angles (degrees, 0 when nothing was done)."""
+        from doctr.models._utils import estimate_orientation
+        from doctr.utils.geometry import remove_image_padding, rotate_image
+
+        if self.page_orientation is None:
+            return pages, [0] * len(pages)
+        _, classes, probs = self.page_orientation(pages)
+        general = list(zip(classes, probs))
+        if self.mode == "words":
+            _, out_maps = self.ocr.det_predictor(pages, return_maps=True)
+            bin_thresh = getattr(self.ocr.det_predictor.model.postprocessor, "bin_thresh", 0.3)
+            seg_maps = [(out_map > bin_thresh).astype(np.uint8) * 255 for out_map in out_maps]
+            angles = [estimate_orientation(seg_map, g) for seg_map, g in zip(seg_maps, general)]
+        else:
+            angles = [int(orientation) if conf >= 0.2 else 0 for orientation, conf in general]
+        out = []
+        for page, angle in zip(pages, angles):
+            if angle == 0:
+                out.append(page)
+            else:
+                out.append(remove_image_padding(rotate_image(page, angle, expand=page.shape[0] != page.shape[1])))
+        return out, angles
 
     @torch.no_grad()
     def detect(self, pages: list[np.ndarray]) -> list[dict[str, np.ndarray]]:
@@ -357,6 +387,10 @@ class FieldExtractor:
 
     @torch.no_grad()
     def __call__(self, pages: list[np.ndarray]) -> list[dict[str, list[dict]]]:
+        if self.straighten:
+            pages, self.last_angles = self.straighten_pages(pages)
+        else:
+            self.last_angles = [0] * len(pages)
         if self.mode == "kie":
             doc = self.kie(pages)
             results = []
