@@ -444,6 +444,8 @@ class FieldExtractor:
                         })
             fields = read_fields_from_words({c: list(regions.get(c, [])) for c in self.class_names}, words, self.margin)
             for cls_name, entries in fields.items():
+                # A region with no word inside carries no value: drop it (the fallback may still find one)
+                entries[:] = [e for e in entries if e["value"].strip()]
                 for entry in entries:
                     entry["source"] = "detector"
                 # Fallback only when the detector found nothing or regions whose text yields no usable value:
