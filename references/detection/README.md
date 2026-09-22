@@ -70,6 +70,19 @@ torchrun --nproc_per_node=2 references/detection/train.py \
   --backend nccl
   ```
 
+## Device and mixed precision
+
+Every training and evaluation script accepts `--device`: a CUDA index (`0`), `cuda:N`, `mps` (Apple Silicon GPU) or `cpu`. Without it the script picks CUDA if available, then MPS, then CPU. In distributed mode (`torchrun`) the argument is ignored and each process uses its own GPU.
+
+`--amp` enables automatic mixed precision and is only supported on CUDA. `--amp-dtype bfloat16` (Ampere or newer GPUs) uses bfloat16 instead of float16: it has the range of float32, so it needs no loss scaling and avoids the overflows float16 can produce in some losses.
+
+```shell
+# Apple Silicon: set the fallback so the few ops MPS lacks run on CPU
+PYTORCH_ENABLE_MPS_FALLBACK=1 python references/detection/train.py db_resnet50 --train_path path/to/train --val_path path/to/val --epochs 5 --device mps
+# NVIDIA GPU with bfloat16 mixed precision
+python references/detection/train.py db_resnet50 --train_path path/to/train --val_path path/to/val --epochs 5 --device 0 --amp --amp-dtype bfloat16
+```
+
 ## Data format
 
 To train on your own data you need to provide both `train_path` and `val_path` arguments (or use the built-in datasets shown above).
@@ -131,9 +144,9 @@ labels.json
 }
 ```
 
-Every class must appear in **every** `labels.json` (train and val) and, ideally, in every image entry: use an empty list for a class that has no box in a given image. The class → channel mapping is derived from the sorted set of class names, and the script aborts if train and val expose different classes.
+Every class of the dataset must appear somewhere in each split (train and val); inside an image, a class that has no box is written as an empty list. The class → channel mapping is derived from the sorted set of class names, and the script aborts if train and val expose different classes.
 
-By default a class without any box in an image is *ignored* by the loss (the image may simply not be annotated for it). When your annotations are exhaustive, i.e. "no box" means "this field is not on the page", pass `--exhaustive-labels` so the absence is learnt as background: this is what you want for semantic fields (KIE).
+An image without any box, or a class absent from an image, is trained as background: what the labels say is the truth. If your data is only partially annotated (some classes were not labelled on some images), pass `--mask-empty-classes` so that those channels are ignored by the loss instead.
 
 For pages that will be **photographed** rather than screenshotted or scanned, two switches add the corresponding augmentations: `--perspective 0.2` warps the page (and its boxes) as if photographed at an angle, up to 20 % corner displacement, and `--photo-aug` adds specular reflections (`RandomGlare`), uneven lighting and crumpled-sheet shading (`RandomLighting`), shadows and blur. Synthetic augmentation improves robustness but does not replace real photographs in the training set.
 
@@ -169,7 +182,7 @@ draws the ground-truth polygons on a few pages (`val/audit_viz/`) and runs the p
 ```shell
 PYTORCH_ENABLE_MPS_FALLBACK=1 python references/detection/train.py db_resnet50 --pretrained \
   --train_path data/fields/train --val_path data/fields/val \
-  --device mps -b 2 --epochs 60 --lr 1e-3 --sched cosine --no-hflip --exhaustive-labels \
+  --device mps -b 2 --epochs 60 --lr 1e-3 --sched cosine --no-hflip \
   --early-stop --early-stop-epochs 10 --output_dir runs --name db_resnet50_fields
 ```
 
