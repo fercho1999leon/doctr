@@ -208,14 +208,23 @@ def merge_fragments(boxes: np.ndarray, gap_ratio: float = 0.8) -> np.ndarray:
     return np.stack(clusters)
 
 
-def load_detection_checkpoint(checkpoint: str | Path, device: torch.device, **overrides):
-    """Load a detection model trained with `train.py` from `<name>.pt` + its `<name>.json` sidecar.
+def find_run_metadata(checkpoint: str | Path) -> Path:
+    """The run metadata written by train.py: `<name>.json`, or the run's own file for a `<name>_epoch<N>.pt`."""
+    ckpt = Path(checkpoint)
+    own = ckpt.with_suffix(".json")
+    if own.exists():
+        return own
+    return ckpt.with_name(re.sub(r"_epoch\d+$", "", ckpt.stem) + ".json")
 
-    The sidecar (written by train.py) holds the architecture, the ordered class names and the target-building
-    options, so that inference never depends on a hand-written class list.
+
+def load_detection_checkpoint(checkpoint: str | Path, device: torch.device, **overrides):
+    """Load a detection model trained with `train.py` from `<name>.pt` + the run metadata written next to it.
+
+    The metadata (written once per run by train.py) holds the architecture, the ordered class names and the
+    target-building options, so that inference never depends on a hand-written class list.
     """
     ckpt = Path(checkpoint)
-    sidecar = ckpt.with_suffix(".json")
+    sidecar = find_run_metadata(ckpt)
     if not sidecar.exists():
         raise FileNotFoundError(
             f"{sidecar} not found. Checkpoints must be trained with references/detection/train.py, which writes "
@@ -223,16 +232,27 @@ def load_detection_checkpoint(checkpoint: str | Path, device: torch.device, **ov
         )
     with open(sidecar, encoding="utf-8") as f:
         cfg = json.load(f)
+
+    def setting(key, default=None):
+        """Read a run setting from the top level of the metadata or from the recorded arguments."""
+        for source in (cfg, cfg.get("args") or {}):
+            if source.get(key) is not None:
+                return source[key]
+        return default
+
+    arch = setting("arch") or setting("architecture")
+    if arch is None:
+        raise ValueError(f"{sidecar} does not record the architecture it was trained with")
     kwargs = {
         "pretrained": False,
         "class_names": cfg["class_names"],
-        "assume_straight_pages": cfg.get("assume_straight_pages", True),
+        "assume_straight_pages": setting("assume_straight_pages", True),
     }
-    is_layout = cfg["arch"].startswith("lw_detr")
+    is_layout = arch.startswith("lw_detr")
     if not is_layout:
-        kwargs["mask_empty_classes"] = cfg.get("mask_empty_classes", True)
+        kwargs["mask_empty_classes"] = setting("mask_empty_classes", False)
     kwargs.update(overrides)
-    model = (layout if is_layout else detection).__dict__[cfg["arch"]](**kwargs)
+    model = (layout if is_layout else detection).__dict__[arch](**kwargs)
     state = torch.load(ckpt, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     if list(model.class_names) != list(cfg["class_names"]):
