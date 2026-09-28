@@ -12,6 +12,9 @@ train.py, so nothing has to be typed by hand. Output: one JSON object per image,
 Every field has `value` (text as read), `normalized` (canonical key, see field_utils.extract_key),
 `confidence`, `detection_score`, `geometry` ([xmin, ymin, xmax, ymax], relative) and `words`.
 Classes without detection map to an empty list, so `result["cuenta_destino"]` is always defined.
+
+With `--format receipt`, every page is reduced to the versioned, typed payload of `receipt_schema.py` instead (one
+value per business field, ISO date, decimal amount, masked account; JSON Schema in `receipt_schema.json`).
 """
 
 from __future__ import annotations
@@ -19,8 +22,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from field_utils import FieldExtractor, parse_min_score, resolve_device
+from receipt_schema import to_receipt_payload
 
 from doctr.io import DocumentFile
 
@@ -43,11 +48,19 @@ def main(args):
         fallback=args.fallback,
         straighten=args.straighten,
     )
+    model_info = {
+        "checkpoint": Path(args.checkpoint).name,
+        "arch": extractor.cfg["arch"],
+        "git_revision": extractor.cfg.get("git_revision"),
+    }
     results = {}
     for path in args.images:
         pages = DocumentFile.from_pdf(path) if path.lower().endswith(".pdf") else DocumentFile.from_images(path)
         page_results = extractor(pages)
-        results[path] = page_results[0] if len(page_results) == 1 else page_results
+        output = page_results
+        if args.format == "receipt":
+            output = [to_receipt_payload(fields, model=model_info) for fields in page_results]
+        results[path] = output[0] if len(output) == 1 else output
         if not args.quiet:
             angle = extractor.last_angles[0] if extractor.last_angles else 0
             print(f"\n== {path} ==" + (f" (rotated {angle} deg)" if angle else ""))
@@ -118,6 +131,13 @@ def parse_args():
         help="per-class minimum detection score, e.g. numero_control=0.62 (tune with evaluate_fields.py)",
     )
     parser.add_argument("--device", default=None, help="cpu, mps, cuda, cuda:N or a CUDA index (default: auto)")
+    parser.add_argument(
+        "--format",
+        choices=["raw", "receipt"],
+        default="raw",
+        help="'raw': every candidate region per detector class; 'receipt': one typed value per business field "
+        "(receipt_schema.py)",
+    )
     parser.add_argument("--json", default=None, help="write the results to this JSON file")
     parser.add_argument("--quiet", action="store_true", help="do not print the per-image summary")
     if len(sys.argv) == 1:

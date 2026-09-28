@@ -1,0 +1,904 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "receipt_schema.json",
+ "title": "Receipt fields",
+ "description": "Payload built by references/detection/receipt_schema.py (to_receipt_payload).",
+ "type": "object",
+ "required": [
+  "schema_version",
+  "fields",
+  "missing_required",
+  "model"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "schema_version": {
+   "const": "1.0"
+  },
+  "missing_required": {
+   "type": "array",
+   "items": {
+    "enum": [
+     "receipt_number",
+     "date",
+     "total",
+     "destination"
+    ]
+   }
+  },
+  "model": {
+   "type": "object"
+  },
+  "fields": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "receipt_number",
+    "receipt_control",
+    "date",
+    "total",
+    "destination",
+    "payer_name",
+    "payer_document"
+   ],
+   "properties": {
+    "receipt_number": {
+     "type": "object",
+     "required": [
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "string",
+         "pattern": "^[A-Z0-9]+$"
+        }
+       ],
+       "description": "receipt number without prefix, upper-case alphanumeric"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      }
+     },
+     "additionalProperties": false
+    },
+    "receipt_control": {
+     "type": "object",
+     "required": [
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "string",
+         "pattern": "^[A-Z0-9]+$"
+        }
+       ],
+       "description": "control number, upper-case alphanumeric"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      }
+     },
+     "additionalProperties": false
+    },
+    "date": {
+     "type": "object",
+     "required": [
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "time",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "string",
+         "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        }
+       ],
+       "description": "ISO date YYYY-MM-DD"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      },
+      "time": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "string",
+         "pattern": "^[0-2][0-9]:[0-5][0-9]$"
+        }
+       ]
+      }
+     },
+     "additionalProperties": false
+    },
+    "total": {
+     "type": "object",
+     "required": [
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "string",
+         "pattern": "^[0-9]+\\.[0-9]{2}$"
+        }
+       ],
+       "description": "decimal amount with two decimals, dot separator"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      }
+     },
+     "additionalProperties": false
+    },
+    "destination": {
+     "type": "object",
+     "required": [
+      "account_holder",
+      "account_suffix",
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "masked account ****<digits> or, when only the holder was read, the holder's name"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      },
+      "account_suffix": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "string",
+         "pattern": "^[0-9]+$"
+        }
+       ]
+      },
+      "account_holder": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "additionalProperties": false
+    },
+    "payer_name": {
+     "type": "object",
+     "required": [
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "upper-case name without accents"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      }
+     },
+     "additionalProperties": false
+    },
+    "payer_document": {
+     "type": "object",
+     "required": [
+      "alternatives",
+      "confidence",
+      "detection_score",
+      "geometry",
+      "normalized",
+      "ocr_confidence",
+      "source",
+      "valid",
+      "value"
+     ],
+     "properties": {
+      "value": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "text as read on the receipt"
+      },
+      "normalized": {
+       "type": [
+        "string",
+        "null"
+       ],
+       "description": "not produced by the current model: always null"
+      },
+      "valid": {
+       "type": "boolean",
+       "description": "normalized holds a usable value of the field type"
+      },
+      "confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "min(ocr_confidence, detection_score)"
+      },
+      "ocr_confidence": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1
+      },
+      "detection_score": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 1,
+       "description": "null for a pattern-fallback value"
+      },
+      "source": {
+       "enum": [
+        "detector",
+        "fallback",
+        null
+       ]
+      },
+      "geometry": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "number"
+         },
+         "minItems": 4,
+         "maxItems": 4
+        }
+       ],
+       "description": "[xmin, ymin, xmax, ymax] relative to the page"
+      },
+      "alternatives": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "required": [
+         "value",
+         "normalized",
+         "confidence"
+        ],
+        "properties": {
+         "value": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "normalized": {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         "confidence": {
+          "type": [
+           "number",
+           "null"
+          ]
+         }
+        }
+       }
+      }
+     },
+     "additionalProperties": false
+    }
+   }
+  }
+ }
+}

@@ -20,6 +20,10 @@ Output layout (one folder per split):
 Documents whose page images are near-duplicates (perceptual hash within --dup-threshold) are grouped and always land in
 the same split. The split is stratified on the presence of each class, so rare fields are represented
 in both train and val.
+
+The same transaction uploaded twice (a screenshot and a photo of it) does not look alike to the perceptual hash; its
+annotated receipt number does. The audit lists every receipt number shared across splits, and `--group-by-key` groups
+those documents as well so that they never straddle train and test.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import io
 import json
 import math
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -81,20 +86,23 @@ def decode_page_image(page: dict) -> tuple[Image.Image, str]:
 
 
 def entity_polygon(entity: dict, width: int, height: int) -> np.ndarray | None:
-    """Return the entity polygon as absolute pixel coordinates with shape (4, 2), or None if unusable."""
-    refs = entity.get("pageAnchor", {}).get("pageRefs", [])
-    if not refs:
+    """Return the entity polygon as absolute pixel coordinates with shape (4, 2), or None if unusable.
+
+    An entity drawn as several regions (one page reference each, e.g. a value split over two lines) is the
+    axis-aligned box around all of them; only the references to the first page are used.
+    """
+    refs = [r for r in entity.get("pageAnchor", {}).get("pageRefs", []) if int(r.get("page", 0) or 0) == 0]
+    pts = []
+    for ref in refs:
+        poly = ref.get("boundingPoly", {})
+        vertices = poly.get("normalizedVertices")
+        if vertices:
+            pts.extend((v.get("x", 0.0) * width, v.get("y", 0.0) * height) for v in vertices)
+        else:
+            pts.extend((v.get("x", 0.0), v.get("y", 0.0)) for v in poly.get("vertices") or [])
+    if not pts:
         return None
-    poly = refs[0].get("boundingPoly", {})
-    vertices = poly.get("normalizedVertices")
-    if vertices:
-        pts = [(v.get("x", 0.0) * width, v.get("y", 0.0) * height) for v in vertices]
-    else:
-        vertices = poly.get("vertices")
-        if not vertices:
-            return None
-        pts = [(v.get("x", 0.0), v.get("y", 0.0)) for v in vertices]
-    if len(pts) != 4:
+    if len(refs) > 1 or len(pts) != 4:
         # Fall back to the axis-aligned box around whatever polygon we were given
         xs, ys = zip(*pts)
         pts = [(min(xs), min(ys)), (max(xs), min(ys)), (max(xs), max(ys)), (min(xs), max(ys))]
@@ -150,6 +158,9 @@ def load_documents(inputs: list[Path], rename: dict[str, str], drop: set[str], l
         seen_ids[doc_id] = path
 
         boxes = []
+        nested = sum(len(ent.get("properties") or []) for ent in data.get("entities", []))
+        if nested:
+            log(f"[warn] {path}: {nested} nested entities (properties) ignored, only top-level entities are used")
         for ent in data.get("entities", []):
             cls = rename.get(ent["type"], ent["type"])
             if cls in drop:
@@ -180,8 +191,23 @@ def load_documents(inputs: list[Path], rename: dict[str, str], drop: set[str], l
     return docs
 
 
-def group_documents(docs: list[dict], threshold: int, log) -> list[list[dict]]:
-    """Group near-duplicate pages (perceptual hash Hamming distance <= threshold, transitively).
+def transaction_keys(doc: dict, key_classes: list[str]) -> set[tuple[str, str]]:
+    """(class, key) pairs identifying the transaction of a document: the longest alphanumeric token of each
+    annotated identifier ("No. 0000737211" -> "0000737211"), kept when long enough (6+ characters, at least 4
+    digits) not to collide by chance."""
+    keys = set()
+    for b in doc["boxes"]:
+        if b["class"] in key_classes:
+            tokens = [t for t in re.findall(r"[A-Z0-9]+", b["text"].upper()) if sum(ch.isdigit() for ch in t) >= 4]
+            key = max(tokens, key=len, default="")
+            if len(key) >= 6:
+                keys.add((b["class"], key))
+    return keys
+
+
+def group_documents(docs: list[dict], threshold: int, log, key_classes: list[str] | None = None) -> list[list[dict]]:
+    """Group near-duplicate pages (perceptual hash Hamming distance <= threshold, transitively), and with
+    `key_classes` the documents sharing an annotated identifier (same transaction).
     Groups are never split across train/val. Exact byte-identical pages are reported as well."""
     parent = list(range(len(docs)))
 
@@ -195,6 +221,14 @@ def group_documents(docs: list[dict], threshold: int, log) -> list[list[dict]]:
         for j in range(i + 1, len(docs)):
             if hamming(docs[i]["phash"], docs[j]["phash"]) <= threshold:
                 parent[find(i)] = find(j)
+    if key_classes:
+        first_with_key: dict[tuple[str, str], int] = {}
+        for i, doc in enumerate(docs):
+            for key in transaction_keys(doc, key_classes):
+                if key in first_with_key:
+                    parent[find(i)] = find(first_with_key[key])
+                else:
+                    first_with_key[key] = i
     groups: dict[int, list[dict]] = collections.OrderedDict()
     for i, doc in enumerate(docs):
         groups.setdefault(find(i), []).append(doc)
@@ -330,9 +364,33 @@ def write_split(split_name: str, docs: list[dict], class_names: list[str], out_d
     return manifest
 
 
-def audit(splits: dict[str, list[dict]], class_names: list[str], max_text_len: int, log) -> dict:
+def shared_transactions(splits: dict[str, list[dict]], key_classes: list[str]) -> list[dict]:
+    """Identifiers annotated in documents of more than one split: the same receipt trained on and evaluated."""
+    where: dict[tuple[str, str], dict[str, list[str]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+    for split_name, docs in splits.items():
+        for doc in docs:
+            for key in transaction_keys(doc, key_classes):
+                where[key][split_name].append(doc["id"])
+    return [
+        {"class": cls_name, "key": key, "docs": dict(by_split)}
+        for (cls_name, key), by_split in sorted(where.items())
+        if len(by_split) > 1
+    ]
+
+
+def audit(
+    splits: dict[str, list[dict]], class_names: list[str], max_text_len: int, log, key_classes: list[str] = ()
+) -> dict:
     """Compute and print dataset statistics that matter for detection + recognition of the fields."""
     report: dict = {"class_names": class_names, "splits": {}}
+    shared = shared_transactions(splits, list(key_classes))
+    report["identifiers_shared_across_splits"] = shared
+    if shared:
+        log(
+            f"[audit] {len(shared)} annotated identifiers appear in more than one split (same transaction uploaded "
+            "twice?): the held-out scores are optimistic. Re-run with --group-by-key. "
+            + ", ".join(f"{s['class']}={s['key']} {s['docs']}" for s in shared[:10])
+        )
     for split_name, docs in splits.items():
         boxes_per_class = collections.Counter()
         docs_with_class = collections.Counter()
@@ -421,7 +479,7 @@ def main(args):
         if rare:
             log(f"[warn] classes with fewer than {args.min_boxes_per_class} boxes: {rare} (consider --drop)")
 
-    groups = group_documents(docs, args.dup_threshold, log)
+    groups = group_documents(docs, args.dup_threshold, log, args.key_classes if args.group_by_key else None)
     test: list[dict] = []
     if args.folds:
         train, val = kfold_group_split(groups, args.folds, args.fold, args.seed)
@@ -448,6 +506,7 @@ def main(args):
         "drop": sorted(drop),
         "seed": args.seed,
         "split_strategy": split_desc,
+        "group_by_key": args.key_classes if args.group_by_key else None,
     }
     splits = {"train": train, args.val_name: val}
     if test:
@@ -456,7 +515,7 @@ def main(args):
         write_split(name, split_docs, class_names, out_dir, meta)
         log(f"wrote {name}: {len(split_docs)} images -> {out_dir / name}")
 
-    report = audit(splits, class_names, args.max_text_len, log)
+    report = audit(splits, class_names, args.max_text_len, log, args.key_classes)
     report["meta"] = meta
     with open(out_dir / "audit.json", "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
@@ -486,6 +545,17 @@ def parse_args():
         type=int,
         default=8,
         help="max Hamming distance (out of 256 bits) between page hashes to treat two pages as near-duplicates",
+    )
+    parser.add_argument(
+        "--key-classes",
+        nargs="*",
+        default=["numero_comprobante", "numero_control"],
+        help="classes whose annotated text identifies a transaction (audited for train/test leaks)",
+    )
+    parser.add_argument(
+        "--group-by-key",
+        action="store_true",
+        help="keep documents sharing an identifier of --key-classes in the same split (changes the split)",
     )
     parser.add_argument("--rename", nargs="*", default=[], help="class renames, e.g. facha=fecha")
     parser.add_argument("--drop", nargs="*", default=[], help="classes to discard, e.g. numero_cuenta")

@@ -41,6 +41,7 @@ from doctr.models import layout, login_to_hub, push_to_hf_hub
 from doctr.utils.metrics import ObjectDetectionMetric
 from utils import (
     EarlyStopper,
+    ModelEMA,
     amp_dtype,
     build_param_groups,
     convert_target,
@@ -143,7 +144,7 @@ def record_lr(
     return lr_recorder[: len(loss_recorder)], loss_recorder
 
 
-def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, amp=False, log=None, rank=0):
+def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, amp=False, log=None, rank=0, ema=None):
     if amp:
         scaler = _scaler()
 
@@ -173,6 +174,8 @@ def fit_one_epoch(model, train_loader, batch_transforms, optimizer, scheduler, a
             train_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
             optimizer.step()
+        if ema is not None:
+            ema.update(model.module if hasattr(model, "module") else model)
 
         scheduler.step()
         last_lr = scheduler.get_last_lr()[0]
@@ -451,7 +454,7 @@ def main(args):
                 *hflip,
                 *perspective,
                 T.OneOf([
-                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
+                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(args.crop_scale_min, 1.0)), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
                 ]),
                 T.Resize(
@@ -466,7 +469,7 @@ def main(args):
                 *hflip,
                 *perspective,
                 T.OneOf([
-                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(0.75, 1.0)), 0.25),
+                    T.RandomApply(T.RandomCrop(ratio=(0.85, 1.15), scale=(args.crop_scale_min, 1.0)), 0.25),
                     T.RandomResize(scale_range=(0.4, 0.9), preserve_aspect_ratio=0.5, symmetric_pad=0.5, p=0.25),
                 ]),
                 # Rotation augmentation
@@ -719,8 +722,14 @@ def main(args):
             clearml_log_at_step(train_loss, val_loss, lr)
         global_step += 1  # Increment the shared global step counter
 
-    # Create loss queue
-    min_loss = np.inf
+    # Weights averaged over the iterations: evaluated, selected and saved instead of the raw weights
+    ema = None
+    if args.ema:
+        ema = ModelEMA(model.module if hasattr(model, "module") else model, args.ema_decay, args.ema_tau)
+
+    # Checkpoint selection and early stopping follow the same quantity, always "lower is better": the validation loss
+    # or the negated mAP@[.5:.95] (the DETR loss mixes matching-dependent terms and tracks accuracy loosely)
+    best_score = np.inf
     if args.early_stop:
         early_stopper = EarlyStopper(patience=args.early_stop_epochs, min_delta=args.early_stop_delta)
 
@@ -737,10 +746,11 @@ def main(args):
             amp=args.amp,
             log=log_at_step,
             rank=rank,
+            ema=ema,
         )
         # Validation loop at the end of each epoch
         val_loss, map5095, ap50, ap75 = evaluate(
-            model,
+            ema.module if ema is not None else model,
             val_loader,
             batch_transforms,
             val_metric,
@@ -748,13 +758,15 @@ def main(args):
             log=log_at_step,
         )
 
+        # mAP is undefined (None) without predictions: never better than a defined value
+        score = val_loss if args.select_by == "val_loss" else -(map5095 if map5095 is not None else -np.inf)
         if rank == 0:
             pbar.write(f"Epoch {epoch + 1}/{args.epochs} - Training loss: {train_loss:.6f} | LR: {actual_lr:.6f}")
-            params = model.module if hasattr(model, "module") else model
-            if val_loss < min_loss:
-                pbar.write(f"Validation loss decreased {min_loss:.6f} --> {val_loss:.6f}: saving state...")
+            params = ema.module if ema is not None else (model.module if hasattr(model, "module") else model)
+            if score < best_score:
+                pbar.write(f"Validation {args.select_by} improved: saving state...")
                 save_checkpoint(params, args.output_dir, exp_name)
-                min_loss = val_loss
+                best_score = score
             if args.save_interval_epoch:
                 pbar.write(f"Saving state at epoch: {epoch + 1}")
                 save_checkpoint(params, args.output_dir, f"{exp_name}_epoch{epoch + 1}")
@@ -787,7 +799,7 @@ def main(args):
                 logger.report_scalar(title="AP@[.5]", series="AP@[.5]", value=ap50, iteration=epoch)
                 logger.report_scalar(title="AP@[.75]", series="AP@[.75]", value=ap75, iteration=epoch)
 
-        if args.early_stop and early_stopper.early_stop(val_loss):
+        if args.early_stop and early_stopper.early_stop(score):
             if rank == 0:
                 pbar.write("Training halted early due to reaching patience limit.")
             break
@@ -885,6 +897,20 @@ def parse_args():
         choices=["float16", "bfloat16"],
         default="float16",
         help="autocast dtype for --amp; bfloat16 (Ampere+ GPUs) avoids float16 overflows, no loss scaling",
+    )
+    parser.add_argument(
+        "--crop-scale-min", type=float, default=0.75, help="minimum area ratio kept by the random crop augmentation"
+    )
+    parser.add_argument(
+        "--ema", action="store_true", help="evaluate, select and save an exponential moving average of the weights"
+    )
+    parser.add_argument("--ema-decay", type=float, default=0.993, help="final decay of the weight average (--ema)")
+    parser.add_argument("--ema-tau", type=float, default=100.0, help="updates over which the EMA decay ramps up")
+    parser.add_argument(
+        "--select-by",
+        choices=["val_loss", "map"],
+        default="val_loss",
+        help="quantity used to keep the best checkpoint and for early stopping: validation loss or mAP@[.5:.95]",
     )
     parser.add_argument("--find-lr", action="store_true", help="Gridsearch the optimal LR")
     parser.add_argument("--early-stop", action="store_true", help="Enable early stopping")

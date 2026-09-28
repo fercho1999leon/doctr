@@ -8,6 +8,7 @@ geometry helpers, word-to-region assignment and checkpoint metadata."""
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import unicodedata
@@ -243,10 +244,17 @@ def load_detection_checkpoint(checkpoint: str | Path, device: torch.device, **ov
     arch = setting("arch") or setting("architecture")
     if arch is None:
         raise ValueError(f"{sidecar} does not record the architecture it was trained with")
+    # Callers read these three from the returned metadata: resolve them once here, wherever the run recorded them
+    cfg = {
+        **cfg,
+        "arch": arch,
+        "input_size": setting("input_size"),
+        "assume_straight_pages": setting("assume_straight_pages", not setting("rotation", False)),
+    }
     kwargs = {
         "pretrained": False,
         "class_names": cfg["class_names"],
-        "assume_straight_pages": setting("assume_straight_pages", True),
+        "assume_straight_pages": cfg["assume_straight_pages"],
     }
     is_layout = arch.startswith("lw_detr")
     if not is_layout:
@@ -509,43 +517,52 @@ _TIME_ANY_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm|a\.m\.|
 _PREFIX_RE = re.compile(r"^(?:n[o°º]\.?|nro\.?|num(?:ero)?\.?|#|comprobante|control|ref\.?)\s*:?\s*", re.I)
 
 
-def _key_fecha(text: str) -> str:
-    t = unicodedata.normalize("NFKC", text).lower()
+def _find_date(t: str) -> tuple[datetime.date, int] | None:
+    """First calendar-valid date in `t` (lower-cased) and the offset where it ends.
+
+    Every occurrence of a pattern is tried, not only the first one: a time read with dots ("14.22.40") matches the
+    numeric pattern before the real date does.
+    """
     for idx, pat in enumerate(_DATE_PATTERNS):
-        m = pat.search(t)
-        if not m:
-            continue
-        a, b, c = m.groups()
-        try:
-            if idx == 0:
-                day, month, year = int(a), _MONTHS_ES[b.lower()], int(c)
-            elif idx == 1:
-                year, month, day = int(a), _MONTHS_ES[b.lower()], int(c)
-            elif idx == 2:
-                year, month, day = int(a), int(b), int(c)
-            else:
-                day, month, year = int(a), int(b), int(c)
-                if year < 100:
-                    year += 2000
-            if not (1 <= day <= 31 and 1 <= month <= 12):
+        for m in pat.finditer(t):
+            a, b, c = m.groups()
+            try:
+                if idx == 0:
+                    day, month, year = int(a), _MONTHS_ES[b.lower()], int(c)
+                elif idx == 1:
+                    year, month, day = int(a), _MONTHS_ES[b.lower()], int(c)
+                elif idx == 2:
+                    year, month, day = int(a), int(b), int(c)
+                else:
+                    if len(c) == 3:  # a truncated year ("16/09/202") is not a date
+                        continue
+                    day, month, year = int(a), int(b), int(c)
+                    if year < 100:
+                        year += 2000
+                if not _MIN_YEAR <= year <= _MAX_YEAR:
+                    continue
+                return datetime.date(year, month, day), m.end()
+            except (KeyError, ValueError):  # unknown month, or no such day (31/02)
                 continue
-        except (KeyError, ValueError):
-            continue
-        # The canonical key is the day only: the time is optional on receipts and often printed on another
-        # line, use `extract_time` when you need it
-        return f"{year:04d}-{month:02d}-{day:02d}"
-    return ""
+    return None
+
+
+# Receipts are recent: a year outside this range is an OCR error or another number
+_MIN_YEAR, _MAX_YEAR = 2000, 2099
+
+
+def _key_fecha(text: str) -> str:
+    # The canonical key is the day only: the time is optional on receipts and often printed on another
+    # line, use `extract_time` when you need it
+    found = _find_date(unicodedata.normalize("NFKC", text).lower())
+    return found[0].isoformat() if found else ""
 
 
 def extract_time(text: str) -> str:
     """HH:MM found in a date field ("" if none). Handles glued times, OCR '.' for ':' and am/pm."""
     t = unicodedata.normalize("NFKC", text or "").lower()
-    tm = None
-    for pat in _DATE_PATTERNS:
-        m = pat.search(t)
-        if m:
-            tm = _TIME_AFTER_RE.match(t, m.end())
-            break
+    found = _find_date(t)
+    tm = _TIME_AFTER_RE.match(t, found[1]) if found else None
     tm = tm or _TIME_ANY_RE.search(t)
     if not tm:
         return ""
@@ -558,10 +575,12 @@ def extract_time(text: str) -> str:
 
 
 def _key_amount(text: str) -> str:
+    """Amount with two decimals ("1,234.50", "1.234,50", "$25" -> "25.00")."""
     m = re.search(r"\d[\d.,]*", text)
     if not m:
         return ""
-    raw = m.group(0)
+    # A separator ending the number is punctuation ("USD 25.00." read 2500.00 before), not part of it
+    raw = m.group(0).rstrip(".,")
     if "," in raw and "." in raw:
         dec = "," if raw.rfind(",") > raw.rfind(".") else "."
         raw = raw.replace("." if dec == "," else ",", "").replace(dec, ".")

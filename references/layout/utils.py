@@ -188,6 +188,40 @@ class EarlyStopper:
         return False
 
 
+class ModelEMA:
+    """Exponential moving average of the model weights, as in the LW-DETR / RT-DETR training recipes.
+
+    The decay ramps up as `decay * (1 - exp(-updates / tau))`, so the average follows the model closely during the
+    first iterations and smooths it later on. Buffers that are not floating point (counters) are copied as is.
+
+    Args:
+        model: the model being trained (unwrapped from DDP)
+        decay: final decay of the average
+        tau: number of updates over which the decay ramps up
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.993, tau: float = 100.0):
+        import copy
+
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.tau = tau
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.updates += 1
+        d = self.decay * (1 - np.exp(-self.updates / self.tau))
+        current = model.state_dict()
+        for name, value in self.module.state_dict().items():
+            if value.dtype.is_floating_point:
+                value.mul_(d).add_(current[name].detach(), alpha=1 - d)
+            else:
+                value.copy_(current[name])
+
+
 def resolve_device(device: str | int | None) -> torch.device:
     """Turn a CLI device spec (None, "cpu", "mps", "cuda", "cuda:1", 0) into a torch device.
 

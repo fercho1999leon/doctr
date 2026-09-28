@@ -16,6 +16,11 @@ Reports, per class (matched by name, never by position):
     receipt number without "No." prefix, account -> digit suffix, name -> letters), see field_utils.extract_key.
     It is geometry-free: the value returned for the field is compared whatever region (or fallback) produced it
   - the percentage of documents where every required field is read correctly (exact and key)
+  - value accuracy: the ONE value a consumer receives per field (`receipt_schema.select_entry`, whatever
+    `--top-k-per-class`) compared with the canonical keys of the annotations; a field absent from the annotations
+    is right only when nothing is returned. Broken down by the kind of annotation (digits or letters only), since
+    some templates annotate the account holder's name instead of the masked account number. Unlike the key match
+    above it does not depend on how many regions are kept, so it is the number to compare between runs.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from field_utils import (
     resolve_device,
 )
 from PIL import Image
+from receipt_schema import select_entry
 
 
 def match_boxes(gts: list[np.ndarray], preds: list[np.ndarray], iou_thresh: float) -> list[tuple[int, int]]:
@@ -63,7 +69,9 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
     det = {c: {"tp": 0, "fp": 0, "fn": 0, "iou": []} for c in class_names}
     absent = {c: {"docs_absent": 0, "docs_with_fp": 0} for c in class_names}
     text = {c: {"n": 0, "exact": 0, "exact_nospace": 0, "key": 0} for c in class_names}
-    docs_all_required, docs_all_required_key, n_docs = 0, 0, 0
+    # One value per field: {annotation kind: [documents, correct]}
+    value = {c: collections.defaultdict(lambda: [0, 0]) for c in class_names}
+    docs_all_required, docs_all_required_key, docs_all_required_value, n_docs = 0, 0, 0, 0
     per_doc = []
     # Per class and document: (score of the best-scored prediction or None, has ground truth, best pred matches)
     sweep: dict[str, list[tuple[float | None, bool, bool]]] = {c: [] for c in class_names}
@@ -77,7 +85,7 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
         gt_by_class: dict[str, list[dict]] = collections.defaultdict(list)
         for b in doc["boxes"]:
             gt_by_class[b["class"]].append(b)
-        doc_ok, doc_key_ok = True, True
+        doc_ok, doc_key_ok, doc_value_ok = True, True, True
         doc_report = {"id": doc["id"], "fields": {}}
         for c in class_names:
             gts = gt_by_class.get(c, [])
@@ -129,9 +137,19 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                     "pred_key": pred_key,
                     "key_ok": key_ok,
                 })
+            chosen, _ = select_entry(preds)
+            value_key = extract_key(c, chosen["value"]) if chosen else ""
+            gt_keys = [extract_key(c, g["text"]) for g in gts]
+            value_ok = any(keys_match(c, k, value_key) for k in gt_keys) if gts else chosen is None
+            kind = annotation_kind(gt_keys) if gts else "absent"
+            value[c][kind][0] += 1
+            value[c][kind][1] += int(value_ok)
             doc_report["fields"][c] = {
                 "ok": field_ok,
                 "key_ok": field_key_ok,
+                "value_ok": value_ok,
+                "value_key": value_key,
+                "annotation_kind": kind,
                 "n_gt": len(gts),
                 "n_pred": len(preds),
                 "entries": entries,
@@ -139,10 +157,13 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
             if c in required:
                 doc_ok &= field_ok
                 doc_key_ok &= field_key_ok
+                doc_value_ok &= value_ok
         docs_all_required += int(doc_ok)
         docs_all_required_key += int(doc_key_ok)
+        docs_all_required_value += int(doc_value_ok)
         doc_report["all_required_ok"] = doc_ok
         doc_report["all_required_key_ok"] = doc_key_ok
+        doc_report["all_required_value_ok"] = doc_value_ok
         per_doc.append(doc_report)
 
     def prf(tp, fp, fn):
@@ -173,6 +194,13 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 "key_match": text[c]["key"] / text[c]["n"] if text[c]["n"] else None,
                 "key_match_by_source": dict(sources[c]),
             },
+            "value": {
+                "accuracy": sum(ok for _, ok in value[c].values()) / n_docs if n_docs else None,
+                "by_annotation": {
+                    kind: {"n": n, "correct": ok, "accuracy": ok / n if n else None}
+                    for kind, (n, ok) in sorted(value[c].items())
+                },
+            },
         }
     thresholds = tune_thresholds(sweep)
     for c in class_names:
@@ -189,9 +217,19 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
         "docs_all_required_ok_ratio": docs_all_required / n_docs if n_docs else None,
         "docs_all_required_key_ok": docs_all_required_key,
         "docs_all_required_key_ok_ratio": docs_all_required_key / n_docs if n_docs else None,
+        "docs_all_required_value_ok": docs_all_required_value,
+        "docs_all_required_value_ok_ratio": docs_all_required_value / n_docs if n_docs else None,
         "per_class": summary,
         "per_document": per_doc,
     }
+
+
+def annotation_kind(gt_keys: list[str]) -> str:
+    """'digits' when an annotation of the field yields a numeric (or date/amount) key, 'letters' when every one only
+    yields letters (e.g. the account holder's name annotated instead of the account), 'empty' otherwise."""
+    if any(any(ch.isdigit() for ch in k) for k in gt_keys):
+        return "digits"
+    return "letters" if any(gt_keys) else "empty"
 
 
 def tune_thresholds(sweep: dict[str, list[tuple[float | None, bool, bool]]]) -> dict[str, dict]:
@@ -320,9 +358,31 @@ def to_markdown(report: dict, title: str) -> str:
         f"as exact text, **{report['docs_all_required_key_ok']} / {report['n_docs']}** "
         f"({fmt(report['docs_all_required_key_ok_ratio'])}) as canonical keys"
     )
+    lines += ["", "## One value per field (what a consumer receives)", ""]
+    lines.append("| class | value accuracy | annotated with digits | annotated with letters only | absent |")
+    lines.append("|---|---|---|---|---|")
+    for c, s in report["per_class"].items():
+        by = s["value"]["by_annotation"]
+
+        def cell(kind, by=by):
+            return f"{fmt(by[kind]['accuracy'])} ({by[kind]['correct']}/{by[kind]['n']})" if kind in by else "-"
+
+        lines.append(
+            f"| {c} | {fmt(s['value']['accuracy'])} | {cell('digits')} | {cell('letters')} | {cell('absent')} |"
+        )
+    lines += [
+        "",
+        f"Documents with every required field right as one value: **{report['docs_all_required_value_ok']} / "
+        f"{report['n_docs']}** ({fmt(report['docs_all_required_value_ok_ratio'])})",
+    ]
     tuned = {c: s["threshold"] for c, s in report["per_class"].items() if s.get("threshold")}
     if tuned:
         lines += ["", "## Suggested minimum detection score per class (tuned on this split)", ""]
+        lines.append(
+            "Tune on `val` and apply the values to `test`: thresholds tuned on the split they are scored on are "
+            "optimistic."
+        )
+        lines.append("")
         lines.append("| class | min score | F1 with it | P | R | F1 without |")
         lines.append("|---|---|---|---|---|---|")
         for c, t in tuned.items():

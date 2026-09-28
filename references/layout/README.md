@@ -99,7 +99,7 @@ labels.json
 }
 ```
 
-`--labels-name` selects another label file inside the split folders (e.g. `labels_layout.json` written by `references/detection/convert_documentai.py`), `--no-hflip` disables horizontal flips, `--perspective 0.2` and `--photo-aug` add perspective warps and photo-like lighting augmentations for photographed pages, and `--device` accepts a CUDA index, `cuda:N`, `mps` or `cpu`. Each run writes its metadata once, as `<experiment name>.json` next to the checkpoints it saves (architecture, class names, input size, dataset hashes, git revision, arguments).
+`--labels-name` selects another label file inside the split folders (e.g. `labels_layout.json` written by `references/detection/convert_documentai.py`), `--no-hflip` disables horizontal flips, `--perspective 0.2` and `--photo-aug` add perspective warps and photo-like lighting augmentations for photographed pages, and `--device` accepts a CUDA index, `cuda:N`, `mps` or `cpu`. `--crop-scale-min` sets the smallest area kept by the random crop. `--ema` evaluates, selects and saves an exponential moving average of the weights (`--ema-decay`, `--ema-tau`), as in the LW-DETR recipe, and `--select-by map` keeps the checkpoint with the best validation mAP@[.5:.95] instead of the lowest validation loss (early stopping follows the same quantity). Each run writes its metadata once, as `<experiment name>.json` next to the checkpoints it saves (architecture, class names, input size, dataset hashes, git revision, arguments).
 
 ## Slack Logging with tqdm
 
