@@ -498,18 +498,28 @@ _MONTHS_ES = {
     "jun": 6, "junio": 6, "jul": 7, "julio": 7, "ago": 8, "agosto": 8, "sep": 9, "sept": 9, "set": 9,
     "septiembre": 9, "setiembre": 9, "oct": 10, "octubre": 10, "nov": 11, "noviembre": 11, "dic": 12,
     "diciembre": 12, "jan": 1, "apr": 4, "aug": 8, "dec": 12,
+    # English full names (apps set to English): "sep" alone would stop at "sep|tember"
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6, "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
 }  # fmt: skip
 _MONTH_RE = "|".join(sorted(_MONTHS_ES, key=len, reverse=True))
 _SEP = r"(?:\s|[-/.,:])*"  # loose separators the OCR leaves between date tokens
-_DATE_PATTERNS = [
+_DE = rf"(?:del?)?{_SEP}"  # "de" / "del" between date tokens
+# (pattern, order of the captured groups): d = day, m = month number, M = month name, y = year (2 or 4 digits).
+# The order of the list is the order of preference; the later patterns only matter when the earlier ones find nothing
+_DATE_PATTERNS: list[tuple[re.Pattern, str]] = [
     # 16 de septiembre de 2026 / 16 sept 2026 / 16-sep-2026 / E116 de septiembre de - 2026 (OCR glued "El")
-    re.compile(rf"(\d{{1,2}}){_SEP}(?:de)?{_SEP}({_MONTH_RE}){_SEP}(?:de)?{_SEP}(\d{{4}})", re.I),
+    (re.compile(rf"(\d{{1,2}}){_SEP}{_DE}({_MONTH_RE}){_SEP}{_DE}(\d{{4}})", re.I), "dMy"),
     # 2026/ago./26 / 2026-sep-16
-    re.compile(rf"(\d{{4}}){_SEP}({_MONTH_RE}){_SEP}(\d{{1,2}})", re.I),
+    (re.compile(rf"(\d{{4}}){_SEP}({_MONTH_RE}){_SEP}(\d{{1,2}})", re.I), "yMd"),
     # 2026/09/16 / 2026-09-16
-    re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"),
+    (re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"), "ymd"),
     # 16/09/2026 / 16-09-2026 / 16.09.26
-    re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})"),
+    (re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})"), "dmy"),
+    # sep 16, 2026 / septiembre 16 de 2026 / September 16, 2026 (month first)
+    (re.compile(rf"(?<![a-z])({_MONTH_RE}){_SEP}(\d{{1,2}}){_SEP}{_DE}(\d{{4}})(?!\d)", re.I), "Mdy"),
+    # 16-SEP-26 / 16 sep 26 (month name, 2-digit year)
+    (re.compile(rf"(\d{{1,2}}){_SEP}{_DE}({_MONTH_RE}){_SEP}{_DE}(\d{{2}})(?!\d)", re.I), "dMy"),
 ]
 # 14:22, 14:22:40, 08.23:17 (OCR), possibly glued to the date: searched right after the date first
 _TIME_AFTER_RE = re.compile(r"\s*(\d{1,2})[:.](\d{2})(?:[:.]\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?", re.I)
@@ -523,22 +533,17 @@ def _find_date(t: str) -> tuple[datetime.date, int] | None:
     Every occurrence of a pattern is tried, not only the first one: a time read with dots ("14.22.40") matches the
     numeric pattern before the real date does.
     """
-    for idx, pat in enumerate(_DATE_PATTERNS):
+    for pat, order in _DATE_PATTERNS:
         for m in pat.finditer(t):
-            a, b, c = m.groups()
+            parts = dict(zip(order, m.groups()))
             try:
-                if idx == 0:
-                    day, month, year = int(a), _MONTHS_ES[b.lower()], int(c)
-                elif idx == 1:
-                    year, month, day = int(a), _MONTHS_ES[b.lower()], int(c)
-                elif idx == 2:
-                    year, month, day = int(a), int(b), int(c)
-                else:
-                    if len(c) == 3:  # a truncated year ("16/09/202") is not a date
-                        continue
-                    day, month, year = int(a), int(b), int(c)
-                    if year < 100:
-                        year += 2000
+                day = int(parts["d"])
+                month = _MONTHS_ES[parts["M"].lower()] if "M" in parts else int(parts["m"])
+                if len(parts["y"]) == 3:  # a truncated year ("16/09/202") is not a date
+                    continue
+                year = int(parts["y"])
+                if year < 100:
+                    year += 2000
                 if not _MIN_YEAR <= year <= _MAX_YEAR:
                     continue
                 return datetime.date(year, month, day), m.end()

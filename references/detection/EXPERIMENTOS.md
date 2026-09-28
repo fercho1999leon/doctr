@@ -7,6 +7,48 @@ Ninguna cifra de este documento está medida: son hipótesis con su comando. Con
 0.6 puntos y una diferencia menor de ~3 puntos entre dos runs es ruido. Compara siempre sobre los mismos documentos
 (ver "Comparar dos runs").
 
+## Producción: qué está fallando (export de `/system/ocr/stats`, 22–28 sep 2026)
+
+94 corridas de `lw_detr_s_fields_r3_photo` por la API (93 "solo OCR" + 1 reevaluación): 67 éxito (71 %), 27 parciales,
+ningún error del servicio. Latencia mediana 0.54 s (p90 1.4 s; las primeras corridas del 23/09, en ráfaga, 1–5 s).
+
+| campo faltante | corridas | % de 94 | en test (168) |
+|---|---|---|---|
+| Fecha | 15 | 16 % | 5.6 % de fallo |
+| Cuenta destino | 10 (7 `missing`, 3 `unresolved`) | 11 % | 13.3 % de fallo |
+| Nº comprobante | 4 (3 junto con cuenta destino) | 4 % | 3.6 % |
+| Valor | 1 | 1 % | 2.4 % |
+
+- **La fecha es el primer problema en producción y no en test** (16 % frente a 5.6 %): hay algo en los comprobantes
+  reales que el set de test no tiene. Se concentra en días concretos (27/09: 7 de 20), lo que apunta a un formato o
+  app de banco concreto. Varios formatos habituales no se reconocían: año de 2 dígitos con mes en letras
+  (`28-SEP-26`), mes primero (`Sep 28, 2026`), meses en inglés (`28 September 2026`) y `del 2026`. Ya están
+  soportados (tests en `tests/`), pero **sin el texto leído no se puede confirmar que sean estos**.
+- **Cuenta destino**: 3 de 10 son `unresolved` (se leyó una cuenta que no es de la empresa: dígitos mal leídos u otra
+  cuenta) y 7 `missing`. Los 3 casos en que también falta el Nº de comprobante apuntan a una plantilla que el detector
+  no conoce, o a una imagen que no es un comprobante.
+- El valor casi nunca falla: no es donde invertir.
+
+### E0b. Diagnóstico de las 27 parciales (sin GPU, antes de reentrenar)
+
+El export no trae el texto leído, así que no distingue "el detector no encontró la región" de "encontró el texto pero
+no se pudo interpretar". Son dos arreglos distintos (anotar más ejemplos o ampliar el parser):
+
+```bash
+# Descarga las imágenes de las corridas parciales (por Hash / ID desde el ERP) a parciales/ y:
+python references/detection/kie_inference.py --checkpoint <ruta>/lw_detr_s_fields_r3_photo.pt \
+    --top-k-per-class 1 --merge-fragments --fallback --straighten --json parciales.json parciales/*
+```
+
+Para cada campo que falta, mira en `parciales.json`:
+- **Lista vacía**: el detector no encontró la región. Marca la corrida "Para entrenar" en el ERP, anótala en Document AI
+  y súmala al set (E1). Es aprendizaje activo: las corridas parciales son justo los ejemplos que el modelo no sabe resolver.
+- **`value` con texto pero `normalized` vacío**: es un problema del parser. Pásame esos textos (solo la fecha o el
+  número, no nombres ni cuentas) y amplío `extract_key` con un test por formato.
+
+Para el ERP, que el export incluya por cada campo faltante el `value` leído, el `detection_score` y el `source`: con eso
+este diagnóstico sale directo del CSV.
+
 ## Reglas para que los runs sean comparables
 
 1. **Misma partición.** No regeneres `doctr/` con otra semilla ni con `--group-by-key` entre runs. Si E0 detecta
@@ -203,6 +245,7 @@ print("p =", binomtest(len(only_b), n, 0.5).pvalue if n else 1.0)
 | paso | qué | GPU | unidades aprox. |
 |---|---|---|---|
 | E0 | fugas + métrica nueva sobre la base | no | 0 |
+| E0b | diagnóstico de las 27 parciales de producción | no | 0 |
 | E1 | reanotar `cuenta_destino` y reentrenar | L4 | 8–10 |
 | E2–E4 | LR, EMA, selección por mAP (en paralelo si tienes varias sesiones) | L4 | 25–30 |
 | E5 | combinación ganadora + test | L4 | 8–10 |

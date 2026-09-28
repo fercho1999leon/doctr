@@ -88,6 +88,16 @@ def test_load_detection_checkpoint_falls_back_to_args(tmp_path):
         # A time read with dots comes first and matches the numeric pattern: the date after it must still be found
         ("14.22.40 16.09.2026", "2026-09-16"),
         ("Hora 23.59.59 Fecha 01/10/2026", "2026-10-01"),
+        # Month name with a 2-digit year, month first, English names, "del"
+        ("28-SEP-26", "2026-09-28"),
+        ("28 sep 26", "2026-09-28"),
+        ("Sep 28, 2026", "2026-09-28"),
+        ("Septiembre 28 de 2026", "2026-09-28"),
+        ("28 September 2026", "2026-09-28"),
+        ("September 28, 2026 11:35", "2026-09-28"),
+        ("28 de sep. del 2026", "2026-09-28"),
+        # A number followed by a month name is not a date when the day is impossible
+        ("Total 25.00 mar 2026", ""),
         # No such day, truncated or implausible year: no date
         ("31/02/2026", ""),
         ("16/09/202", ""),
