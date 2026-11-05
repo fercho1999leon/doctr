@@ -307,3 +307,100 @@ def test_model_ema_update():
     torch.testing.assert_close(ema.module.weight, torch.full((2,), 2.0))  # 0.5 * 1 + 0.5 * 3
     assert int(ema.module.num_batches_tracked) == 7
     assert not any(p.requires_grad for p in ema.module.parameters())
+
+
+def _docai_json(path, img, entities):
+    import base64
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    w, h = img.size
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ents = []
+    for cls, text, (x0, y0, x1, y1) in entities:
+        verts = [{"x": x0, "y": y0}, {"x": x1, "y": y0}, {"x": x1, "y": y1}, {"x": x0, "y": y1}]
+        ents.append({
+            "type": cls,
+            "mentionText": text,
+            "pageAnchor": {"pageRefs": [{"boundingPoly": {"normalizedVertices": verts}}]},
+        })
+    doc = {"pages": [{"image": {"content": base64.b64encode(buf.getvalue()).decode(), "width": w, "height": h}}]}
+    path.write_text(json.dumps({**doc, "entities": ents}))
+
+
+def test_convert_end_to_end(tmp_path):
+    """A Document AI export folder -> train/val/test splits with images, labels, layout labels and manifest."""
+    from argparse import Namespace
+
+    rng = np.random.default_rng(0)
+    export = tmp_path / "export"
+    for i in range(10):
+        # Distinct pages (random noise) so that no two are grouped as near-duplicates
+        img = Image.fromarray(rng.integers(0, 255, (120, 80, 3), dtype=np.uint8))
+        ents = [
+            ("fecha", f"{i + 1:02d}/09/2026", (0.1, 0.1, 0.6, 0.2)),
+            ("numero_comprobante", f"No. 00007{i:05d}", (0.1, 0.3, 0.9, 0.4)),
+        ]
+        _docai_json(export / f"doc{i}" / "0.json", img, ents)
+    out = tmp_path / "doctr"
+    args = Namespace(
+        input=[str(export)], output=str(out), val_ratio=0.2, val_name="val", test_ratio=0.2, folds=0, fold=0,
+        seed=42, dup_threshold=8, key_classes=["numero_comprobante"], group_by_key=True, rename=[], drop=[],
+        min_boxes_per_class=0, max_text_len=32, keep_split=None,
+    )  # fmt: skip
+    conv.main(args)
+
+    seen = []
+    for split in ("train", "val", "test"):
+        labels = json.loads((out / split / "labels.json").read_text())
+        layout = json.loads((out / split / "labels_layout.json").read_text())
+        manifest = json.loads((out / split / "manifest.json").read_text())
+        assert set(labels) == set(layout) == {d["image"] for d in manifest["documents"]}
+        for name, entry in labels.items():
+            assert set(entry["polygons"]) == {"fecha", "numero_comprobante"}
+            with Image.open(out / split / "images" / name) as im:
+                assert im.size == (80, 120)  # (w, h) of the page, saved from the encoded bytes
+            assert entry["img_dimensions"] == [120, 80]
+            assert layout[name]["classes"] == ["fecha", "numero_comprobante"]
+        seen += list(labels)
+    assert len(seen) == len(set(seen)) == 10
+    assert len(json.loads((out / "test" / "labels.json").read_text())) == 2
+    audit = json.loads((out / "audit.json").read_text())
+    assert audit["identifiers_shared_across_splits"] == []
+
+
+def test_convert_keep_previous_split(tmp_path):
+    """New export = previous documents + new ones: the previous ones keep their split, only the new ones are split."""
+    from argparse import Namespace
+
+    rng = np.random.default_rng(1)
+    export = tmp_path / "export"
+
+    def add_docs(start, n):
+        for i in range(start, start + n):
+            img = Image.fromarray(rng.integers(0, 255, (100, 70, 3), dtype=np.uint8))
+            fecha = ("fecha", f"{i % 28 + 1:02d}/09/2026", (0.1, 0.1, 0.6, 0.2))
+            _docai_json(export / f"doc{i}" / "0.json", img, [fecha])
+
+    def convert(out, keep_split):
+        args = Namespace(
+            input=[str(export)], output=str(out), val_ratio=0.25, val_name="val", test_ratio=0.25, folds=0, fold=0,
+            seed=7, dup_threshold=8, key_classes=[], group_by_key=False, rename=[], drop=[],
+            min_boxes_per_class=0, max_text_len=32, keep_split=keep_split,
+        )  # fmt: skip
+        conv.main(args)
+        return {
+            d["id"]: split
+            for split in ("train", "val", "test")
+            for d in json.loads((out / split / "manifest.json").read_text())["documents"]
+        }
+
+    add_docs(0, 10)
+    v1 = convert(tmp_path / "v1", None)
+    add_docs(10, 6)
+    v2 = convert(tmp_path / "v2", str(tmp_path / "v1"))
+    assert len(v2) == 16
+    assert {k: v2[k] for k in v1} == v1  # every previous document stays where it was
+    new = [v2[f"doc{i}"] for i in range(10, 16)]
+    assert "test" in new and "train" in new  # and the new ones are split with the ratios

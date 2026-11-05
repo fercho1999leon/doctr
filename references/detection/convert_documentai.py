@@ -74,7 +74,11 @@ def hamming(a: str, b: str) -> int:
 
 def decode_page_image(page: dict) -> tuple[Image.Image, str]:
     """Decode the embedded page image. The format is detected from the bytes (many exports lack mimeType)."""
-    raw = base64.b64decode(page["image"]["content"])
+    return decode_image_bytes(base64.b64decode(page["image"]["content"]))
+
+
+def decode_image_bytes(raw: bytes) -> tuple[Image.Image, str]:
+    """Decode an encoded page image and pick the extension it is saved with."""
     img = Image.open(io.BytesIO(raw))
     img.load()
     fmt = img.format or "PNG"
@@ -144,7 +148,10 @@ def load_documents(inputs: list[Path], rename: dict[str, str], drop: set[str], l
         if not page.get("image", {}).get("content"):
             log(f"[skip] {path}: no embedded image")
             continue
-        img, ext = decode_page_image(page)
+        # Only the encoded bytes are kept per document (decoded again in write_split): thousands of decoded photos
+        # do not fit in memory
+        raw = base64.b64decode(page["image"]["content"])
+        img, ext = decode_image_bytes(raw)
         width, height = img.size
         declared = (page["image"].get("width"), page["image"].get("height"))
         if declared != (None, None) and declared != (width, height):
@@ -180,7 +187,7 @@ def load_documents(inputs: list[Path], rename: dict[str, str], drop: set[str], l
             "id": doc_id,
             "source": str(path),
             "source_split": next((r.name for r in inputs if r in path.parents), ""),
-            "image": img,
+            "image_bytes": raw,
             "ext": ext,
             "width": width,
             "height": height,
@@ -188,6 +195,7 @@ def load_documents(inputs: list[Path], rename: dict[str, str], drop: set[str], l
             "pixel_hash": hashlib.sha256(img.tobytes()).hexdigest(),
             "boxes": boxes,
         })
+        del img
     return docs
 
 
@@ -301,6 +309,45 @@ def kfold_group_split(groups: list[list[dict]], folds: int, fold: int, seed: int
     return train, val
 
 
+def load_previous_split(root: Path, val_name: str) -> dict[str, dict[str, str]]:
+    """Where every document of a previous conversion went: {"pixel_hash": {hash: split}, "id": {id: split}},
+    read from `<root>/<split>/manifest.json`. A split folder other than train/test is the validation split."""
+    previous: dict[str, dict[str, str]] = {"pixel_hash": {}, "id": {}}
+    manifests = sorted(root.glob("*/manifest.json"))
+    if not manifests:
+        raise FileNotFoundError(f"no <split>/manifest.json under {root}")
+    for manifest in manifests:
+        split = manifest.parent.name if manifest.parent.name in ("train", "test") else val_name
+        with open(manifest, encoding="utf-8") as f:
+            for doc in json.load(f)["documents"]:
+                if doc.get("pixel_hash"):
+                    previous["pixel_hash"][doc["pixel_hash"]] = split
+                previous["id"][doc["id"]] = split
+    return previous
+
+
+def pin_to_previous_split(
+    groups: list[list[dict]], previous: dict[str, dict[str, str]], val_name: str, log
+) -> tuple[dict[str, list[dict]], list[list[dict]]]:
+    """Keep the documents of a previous conversion in the split they had (matched by decoded pixels, then by
+    document id), so that a model trained on the previous train split is never evaluated on its own training
+    pages. A group holding a previous document follows it; a group mixing splits goes to the most held-out one
+    (test, then validation). Returns {split: documents} for the pinned groups and the groups left to split."""
+    priority = {"test": 0, val_name: 1, "train": 2}
+    pinned: dict[str, list[dict]] = {"train": [], val_name: [], "test": []}
+    free: list[list[dict]] = []
+    for group in groups:
+        splits = {previous["pixel_hash"].get(d["pixel_hash"]) or previous["id"].get(d["id"]) for d in group} - {None}
+        if not splits:
+            free.append(group)
+            continue
+        target = min(splits, key=priority.__getitem__)
+        if len(splits) > 1:
+            log(f"[warn] group {[d['id'] for d in group]} was split across {sorted(splits)}: kept in {target}")
+        pinned[target].extend(group)
+    return pinned, free
+
+
 def write_split(split_name: str, docs: list[dict], class_names: list[str], out_dir: Path, meta: dict) -> dict:
     split_dir = out_dir / split_name
     img_dir = split_dir / "images"
@@ -311,7 +358,7 @@ def write_split(split_name: str, docs: list[dict], class_names: list[str], out_d
         img_name = f"{doc['id']}{doc['ext']}"
         img_path = img_dir / img_name
         save_kwargs = {"quality": 95} if doc["ext"] == ".jpg" else {}
-        doc["image"].save(img_path, **save_kwargs)
+        decode_image_bytes(doc["image_bytes"])[0].save(img_path, **save_kwargs)
         with open(img_path, "rb") as f:
             img_hash = hashlib.sha256(f.read()).hexdigest()
         polygons: dict[str, list] = {c: [] for c in class_names}
@@ -481,6 +528,18 @@ def main(args):
 
     groups = group_documents(docs, args.dup_threshold, log, args.key_classes if args.group_by_key else None)
     test: list[dict] = []
+    pinned: dict[str, list[dict]] = {"train": [], args.val_name: [], "test": []}
+    if args.keep_split:
+        previous = load_previous_split(Path(args.keep_split), args.val_name)
+        pinned, groups = pin_to_previous_split(groups, previous, args.val_name, log)
+        n_prev = len(previous["id"])
+        n_kept = sum(len(v) for v in pinned.values())
+        log(
+            f"\nKept from {args.keep_split}: "
+            + ", ".join(f"{k}={len(v)}" for k, v in pinned.items())
+            + f" ({n_prev - n_kept} previous documents not found in this export); "
+            f"{sum(len(g) for g in groups)} new documents to split"
+        )
     if args.folds:
         train, val = kfold_group_split(groups, args.folds, args.fold, args.seed)
         split_desc = f"grouped {args.folds}-fold, fold {args.fold}"
@@ -493,6 +552,9 @@ def main(args):
             groups = [g for g in groups if g[0]["id"] not in test_ids]
         train, val = stratified_group_split(groups, class_names, args.val_ratio, args.seed + 1)
         split_desc = f"grouped stratified split, val_ratio={args.val_ratio}, test_ratio={args.test_ratio}"
+    if args.keep_split:
+        train, val, test = pinned["train"] + train, pinned[args.val_name] + val, pinned["test"] + test
+        split_desc += f", previous split kept from {args.keep_split}"
     log(f"\nSplit ({split_desc}, seed={args.seed}): train={len(train)} val={len(val)} test={len(test)}")
 
     out_dir = Path(args.output)
@@ -539,6 +601,12 @@ def parse_args():
     )
     parser.add_argument("--folds", type=int, default=0, help="if >0, use grouped K-fold instead of a single split")
     parser.add_argument("--fold", type=int, default=0, help="index of the fold used for validation (with --folds)")
+    parser.add_argument(
+        "--keep-split",
+        default=None,
+        help="output folder of a previous conversion: its documents keep their train/val/test split and only the "
+        "new documents are split with the ratios (so a model trained on the previous train split stays comparable)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="random seed for the split")
     parser.add_argument(
         "--dup-threshold",
@@ -568,6 +636,8 @@ def parse_args():
     args = parser.parse_args()
     if args.folds and not 0 <= args.fold < args.folds:
         parser.error("--fold must be in [0, --folds)")
+    if args.folds and args.keep_split:
+        parser.error("--keep-split cannot be combined with --folds")
     return args
 
 
