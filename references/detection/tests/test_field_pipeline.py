@@ -404,3 +404,45 @@ def test_convert_keep_previous_split(tmp_path):
     assert {k: v2[k] for k in v1} == v1  # every previous document stays where it was
     new = [v2[f"doc{i}"] for i in range(10, 16)]
     assert "test" in new and "train" in new  # and the new ones are split with the ratios
+
+
+# --- cases from the r4 validation report (texts as read by the OCR) -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field, text, expected",
+    [
+        # The "$" of "$10,00" read as "S1": the number with cents is the amount
+        ("valor_transferido", "S1 10,00", "10.00"),
+        ("valor_transferido", "S2 20,00", "20.00"),
+        ("valor_transferido", "S1 15,50", "15.50"),
+        # Zero read for the O of OCT
+        ("fecha", "2026/0CT/01 13H18", "2026-10-01"),
+        # Dots of a masked account read with spaces between them
+        ("cuenta_destino", "SA A a . su Comunicate 21. . 61 1de x", "61"),
+        ("cuenta_destino", "XXXXXX3861 - CORRIENTE", "3861"),
+        ("cuenta_destino", "Comunica-te S.a. 21.61", "61"),
+    ],
+)
+def test_keys_from_r4_failures(field, text, expected):
+    assert fu.extract_key(field, text) == expected
+
+
+def _line(text, y):
+    return {"text": text, "box": [0.1, y, 0.9, y + 0.02], "confidence": 0.9}
+
+
+def test_account_fallback_skips_amounts_and_origin_account():
+    # An amount is never a masked account (it made "25.00" the destination account before)
+    assert fu.find_fallback("cuenta_destino", [_line("$ 16.80", 0.1), _line("Total 25.00", 0.2)]) is None
+    # Both accounts printed: the one on the "destino" row wins, the "origen" one is dropped
+    lines = [
+        _line("Cuenta origen", 0.10),
+        _line("004XXXX893 - AHORRO", 0.10),
+        _line("Cuenta destino", 0.13),
+        _line("XXXXXX3861 - CORRIENTE", 0.13),
+        _line("28.00 USD", 0.30),
+    ]
+    assert fu.find_fallback("cuenta_destino", lines)["normalized"] == "3861"
+    # Without labels the first masked account in reading order is kept
+    assert fu.find_fallback("cuenta_destino", [_line("*** *** 3861", 0.5)])["normalized"] == "3861"

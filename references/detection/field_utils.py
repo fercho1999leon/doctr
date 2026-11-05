@@ -295,6 +295,7 @@ class FieldExtractor:
         merge_fragments: bool = False,
         fallback: bool = False,
         straighten: bool = False,
+        straighten_min_confidence: float = 0.2,
     ) -> None:
         from doctr.models import detection_predictor, kie_predictor, ocr_predictor, page_orientation_predictor
 
@@ -313,6 +314,10 @@ class FieldExtractor:
         # Rotate photos / scans upright before detection: coarse 0/90/180/270 from doctr's page orientation
         # classifier, refined with the skew of the text lines (same recipe as ocr_predictor(straighten_pages=True))
         self.straighten = straighten
+        # Minimum confidence of the page orientation classifier before a page is turned by 90/180/270 degrees
+        # (the small skew of the text lines is corrected either way). 0.2 is ocr_predictor's default; phone photos
+        # with a dark frame can fool the classifier into turning an upright page upside down
+        self.straighten_min_confidence = straighten_min_confidence
         self.page_orientation = page_orientation_predictor(pretrained=True).to(device) if straighten else None
         self.device = device
         from doctr.models import layout_predictor
@@ -361,9 +366,13 @@ class FieldExtractor:
             _, out_maps = self.ocr.det_predictor(pages, return_maps=True)
             bin_thresh = getattr(self.ocr.det_predictor.model.postprocessor, "bin_thresh", 0.3)
             seg_maps = [(out_map > bin_thresh).astype(np.uint8) * 255 for out_map in out_maps]
-            angles = [estimate_orientation(seg_map, g) for seg_map, g in zip(seg_maps, general)]
+            angles = [
+                estimate_orientation(seg_map, g, min_confidence=self.straighten_min_confidence)
+                for seg_map, g in zip(seg_maps, general)
+            ]
         else:
-            angles = [int(orientation) if conf >= 0.2 else 0 for orientation, conf in general]
+            min_conf = self.straighten_min_confidence
+            angles = [int(orientation) if conf >= min_conf else 0 for orientation, conf in general]
         out = []
         for page, angle in zip(pages, angles):
             if angle == 0:
@@ -559,13 +568,18 @@ _MIN_YEAR, _MAX_YEAR = 2000, 2099
 def _key_fecha(text: str) -> str:
     # The canonical key is the day only: the time is optional on receipts and often printed on another
     # line, use `extract_time` when you need it
-    found = _find_date(unicodedata.normalize("NFKC", text).lower())
+    found = _find_date(_fix_month_ocr(unicodedata.normalize("NFKC", text).lower()))
     return found[0].isoformat() if found else ""
+
+
+def _fix_month_ocr(t: str) -> str:
+    """OCR reads the O of "OCT" as a zero ("2026/0CT/01")."""
+    return re.sub(r"(?<![0-9])0(?=ct)", "o", t)
 
 
 def extract_time(text: str) -> str:
     """HH:MM found in a date field ("" if none). Handles glued times, OCR '.' for ':' and am/pm."""
-    t = unicodedata.normalize("NFKC", text or "").lower()
+    t = _fix_month_ocr(unicodedata.normalize("NFKC", text or "").lower())
     found = _find_date(t)
     tm = _TIME_AFTER_RE.match(t, found[1]) if found else None
     tm = tm or _TIME_ANY_RE.search(t)
@@ -580,12 +594,16 @@ def extract_time(text: str) -> str:
 
 
 def _key_amount(text: str) -> str:
-    """Amount with two decimals ("1,234.50", "1.234,50", "$25" -> "25.00")."""
-    m = re.search(r"\d[\d.,]*", text)
-    if not m:
+    """Amount with two decimals ("1,234.50", "1.234,50", "$25" -> "25.00").
+
+    The first number holding cents wins over a bare one before it: the OCR reads the "$" of "$10,00" as "S1"
+    ("S1 10,00"), which made the amount 1.00.
+    """
+    # A separator ending a number is punctuation ("USD 25.00." read 2500.00 before), not part of it
+    numbers = [m.group(0).rstrip(".,") for m in re.finditer(r"\d[\d.,]*", text)]
+    if not numbers:
         return ""
-    # A separator ending the number is punctuation ("USD 25.00." read 2500.00 before), not part of it
-    raw = m.group(0).rstrip(".,")
+    raw = next((n for n in numbers if re.search(r"[.,]\d{2}$", n)), numbers[0])
     if "," in raw and "." in raw:
         dec = "," if raw.rfind(",") > raw.rfind(".") else "."
         raw = raw.replace("." if dec == "," else ",", "").replace(dec, ".")
@@ -619,16 +637,20 @@ def _key_name(text: str) -> str:
     return re.sub(r"[^A-Z]", "", t.upper())
 
 
-# ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR) / 21...61 / 21.61
-_MASKED_ACCOUNT_RE = re.compile(
-    r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}(?=[xX*0.]*[xX*.])[xX*0.]{2,}\d{2,4}\b|\b\d{2,3}\.{1,}\d{2}\b)"
+# ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR) / 21...61 / 21. . 61 (OCR).
+# A masked middle must hold an X or a star, and dots only count from two on: "25.00" or "16.80" is an amount
+_STRICT_MASKED_ACCOUNT_RE = re.compile(
+    r"(?:[*xX•]{2,}\s*\d{2,4}\b|\b\d{2,3}(?=[0.]*[xX*])[xX*0.]{2,}\d{2,4}\b|\b\d{2,3}(?:\s*\.){2,}\s*\d{2}\b)"
 )
+# Inside a region detected as the destination account "21.61" is also an account (some templates print it so).
+# Never used to search a whole page, where it matches every amount
+_MASKED_ACCOUNT_RE = re.compile(rf"(?:{_STRICT_MASKED_ACCOUNT_RE.pattern}|\b\d{{2,3}}\.\d{{2}}\b)")
 
 
 def _key_account(text: str) -> str:
     """Digit suffix of the masked account (****3861 -> 3861, 21XXXXXXX61 -> 61), preferring a masked token over
     any other number on the line (RUC, amount). Without digits (name-only annotation) the letters of the name."""
-    m = _MASKED_ACCOUNT_RE.search(text)
+    m = _STRICT_MASKED_ACCOUNT_RE.search(text) or _MASKED_ACCOUNT_RE.search(text)
     if m:
         return re.findall(r"\d+", m.group(0))[-1]
     runs = re.findall(r"\d+", text)
@@ -655,14 +677,46 @@ _KEY_EXTRACTORS = {
 # Fallback patterns searched over the OCR lines of the whole page when the detector finds nothing for a field.
 # Receipts are highly regular, so a pattern hit is almost always the right value.
 _FALLBACK_LINE_PATTERNS: dict[str, re.Pattern] = {
-    # ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR)
-    "cuenta_destino": _MASKED_ACCOUNT_RE,
+    # ****** 3861 / XXXXXX3861 / 21XXXXXXXXX61 / 210XXX3861 / 21X00000X61 (OCR), never an amount
+    "cuenta_destino": _STRICT_MASKED_ACCOUNT_RE,
     "numero_comprobante": re.compile(
         r"(?:n[o°º]\.?|nro\.?|comprobante|documento|referencia|ref\.?)\s*:?\s*([A-Z0-9]{6,})", re.I
     ),
     "numero_control": re.compile(r"control\W{0,6}([0-9]{5,})", re.I),
     "valor_transferido": re.compile(r"(?:\$|usd)\s*\d[\d.,]*", re.I),
 }
+
+
+def _destination_first(candidates: list[tuple[int, dict, str]], lines: list[dict]) -> list[tuple[int, dict, str]]:
+    """Order masked-account candidates so that the destination account comes first.
+
+    Receipts print both accounts ("Cuenta origen 004XXXX893", "Cuenta destino XXXXXX3861"): a candidate is matched
+    to the nearest label row ("destino" / "origen", same line or the label column next to it). Candidates on an
+    origin row are dropped; candidates on a destination row come first, nearest first.
+    """
+
+    def center_y(line: dict) -> float:
+        return (line["box"][1] + line["box"][3]) / 2
+
+    def rows(word: str) -> list[float]:
+        return [center_y(line) for line in lines if word in unicodedata.normalize("NFKC", line["text"]).lower()]
+
+    dest, orig = rows("destino"), rows("origen")
+    if not dest and not orig:
+        return candidates
+
+    def distance(y: float, labels: list[float]) -> float:
+        return min((abs(y - ly) for ly in labels), default=float("inf"))
+
+    ranked = []
+    for cand in candidates:
+        y = center_y(cand[1])
+        d_dest, d_orig = distance(y, dest), distance(y, orig)
+        if d_orig < d_dest:
+            continue  # on (or nearer to) the origin row
+        ranked.append((d_dest, cand))
+    ranked.sort(key=lambda t: t[0])
+    return [cand for _, cand in ranked]
 
 
 def find_fallback(field: str, lines: list[dict]) -> dict | None:
@@ -683,6 +737,8 @@ def find_fallback(field: str, lines: list[dict]) -> dict | None:
                 candidates.append((i, line, m.group(0)))
     if not candidates:
         return None
+    if field == "cuenta_destino":
+        candidates = _destination_first(candidates, lines)
     # Prefer the candidate whose canonical key is non-empty, then the first one in reading order
     for _, line, text in candidates:
         key = extract_key(field, text)

@@ -47,6 +47,7 @@ def main(args):
         merge_fragments=args.merge_fragments,
         fallback=args.fallback,
         straighten=args.straighten,
+        straighten_min_confidence=args.straighten_min_confidence,
     )
     model_info = {
         "checkpoint": Path(args.checkpoint).name,
@@ -112,6 +113,13 @@ def parse_args():
         "--straighten",
         action="store_true",
         help="rotate photos/scans upright before detection (page orientation classifier + text line skew)",
+    )
+    parser.add_argument(
+        "--straighten-min-confidence",
+        type=float,
+        default=0.2,
+        help="with --straighten: minimum confidence of the page orientation classifier to turn a page by "
+        "90/180/270 degrees (the small skew is corrected either way)",
     )
     parser.add_argument(
         "--fallback",

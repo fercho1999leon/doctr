@@ -166,6 +166,8 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
         doc_report["all_required_ok"] = doc_ok
         doc_report["all_required_key_ok"] = doc_key_ok
         doc_report["all_required_value_ok"] = doc_value_ok
+        # Rotation applied by --straighten (0 when nothing was turned)
+        doc_report["angle"] = (getattr(extractor, "last_angles", None) or [0])[0]
         per_doc.append(doc_report)
 
     def prf(tp, fp, fn):
@@ -429,6 +431,7 @@ def main(args):
         merge_fragments=args.merge_fragments,
         fallback=args.fallback,
         straighten=args.straighten,
+        straighten_min_confidence=args.straighten_min_confidence,
     )
     unknown = [c for c in args.required if c not in manifest["class_names"]]
     if unknown:
@@ -484,6 +487,13 @@ def parse_args():
         "--straighten",
         action="store_true",
         help="rotate photos/scans upright before detection (page orientation classifier + text line skew)",
+    )
+    parser.add_argument(
+        "--straighten-min-confidence",
+        type=float,
+        default=0.2,
+        help="with --straighten: minimum confidence of the page orientation classifier to turn a page by "
+        "90/180/270 degrees (the small skew is corrected either way)",
     )
     parser.add_argument(
         "--fallback",
