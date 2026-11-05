@@ -149,6 +149,8 @@ def evaluate(manifest: dict, data_dir: Path, extractor: FieldExtractor, iou_thre
                 "key_ok": field_key_ok,
                 "value_ok": value_ok,
                 "value_key": value_key,
+                "value_text": chosen["value"] if chosen else "",
+                "value_source": chosen.get("source", "detector") if chosen else None,
                 "annotation_kind": kind,
                 "n_gt": len(gts),
                 "n_pred": len(preds),
